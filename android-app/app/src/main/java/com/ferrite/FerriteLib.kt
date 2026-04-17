@@ -10,6 +10,7 @@ interface FrameCallback {
 
 const val FORMAT_RGBA8 = 0
 const val FORMAT_JPEG = 1
+const val FORMAT_H264 = 2
 
 object FerriteLib {
     init { System.loadLibrary("ferrite_android") }

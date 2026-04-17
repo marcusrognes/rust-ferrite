@@ -2,35 +2,33 @@
 //!
 //! `start()` does the portal handshake on the caller's tokio runtime, then spawns
 //! a dedicated OS thread running the blocking libpipewire mainloop. Each incoming
-//! frame is converted from whatever format PipeWire negotiated to RGB, then
-//! JPEG-encoded, and published on a `watch` channel as a `Frame`.
+//! frame is converted from whatever format PipeWire negotiated into tightly-packed
+//! R,G,B bytes and published on a `watch` channel. Encoders (per client) consume
+//! that RGB stream.
 
 use std::os::fd::OwnedFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow};
 use ashpd::desktop::PersistMode;
 use ashpd::desktop::screencast::{
     CursorMode, Screencast, SelectSourcesOptions, SourceType, Stream as ScStream,
 };
-use ferrite_core::PixelFormat;
 use pipewire as pw;
-use turbojpeg::{Compressor, Image as TjImage, PixelFormat as TjPixelFormat, Subsamp};
 use pw::spa;
 use pw::spa::param::video::{VideoFormat, VideoInfoRaw};
 use pw::{properties::properties, stream::StreamFlags};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-const JPEG_QUALITY: u8 = 70;
+use crate::h264_dump::H264Dump;
 
 pub struct Frame {
-    pub format: PixelFormat,
     pub width: u32,
     pub height: u32,
-    pub data: Vec<u8>,
+    pub rgb: Vec<u8>, // tightly packed, row-major, 3 bytes/pixel
 }
 
 pub type FrameTx = watch::Sender<Option<Arc<Frame>>>;
@@ -94,9 +92,8 @@ async fn open_portal() -> Result<(ScStream, OwnedFd)> {
 struct UserData {
     format: VideoInfoRaw,
     tx: FrameTx,
-    rgb_scratch: Vec<u8>,
-    jpeg_scratch: Vec<u8>,
-    compressor: Compressor,
+    h264_dump: Option<H264Dump>,
+    h264_dump_path: Option<PathBuf>,
 }
 
 fn run_pipewire(fd: OwnedFd, node_id: u32, tx: FrameTx) -> Result<()> {
@@ -106,20 +103,16 @@ fn run_pipewire(fd: OwnedFd, node_id: u32, tx: FrameTx) -> Result<()> {
         pw::context::ContextBox::new(mainloop.loop_(), None).context("ContextBox::new")?;
     let core = context.connect_fd(fd, None).context("connect_fd")?;
 
-    let mut compressor = Compressor::new().context("turbojpeg Compressor::new")?;
-    compressor
-        .set_quality(JPEG_QUALITY as i32)
-        .context("set_quality")?;
-    compressor
-        .set_subsamp(Subsamp::Sub2x2)
-        .context("set_subsamp")?;
+    let h264_dump_path = std::env::var_os("FERRITE_H264_DUMP").map(PathBuf::from);
+    if let Some(p) = &h264_dump_path {
+        info!(path = %p.display(), "H264 dump requested via FERRITE_H264_DUMP");
+    }
 
     let data = UserData {
         format: VideoInfoRaw::default(),
         tx,
-        rgb_scratch: Vec::new(),
-        jpeg_scratch: Vec::new(),
-        compressor,
+        h264_dump: None,
+        h264_dump_path,
     };
 
     let stream = pw::stream::StreamBox::new(
@@ -183,56 +176,31 @@ fn run_pipewire(fd: OwnedFd, node_id: u32, tx: FrameTx) -> Result<()> {
             }
 
             let fmt = user_data.format.format();
-            let wh3 = w as usize * h as usize * 3;
-            if user_data.rgb_scratch.len() != wh3 {
-                user_data.rgb_scratch = vec![0u8; wh3];
-            }
-            if !convert_to_rgb(src, w as usize, h as usize, stride, fmt, &mut user_data.rgb_scratch)
-            {
+            let mut rgb = vec![0u8; w as usize * h as usize * 3];
+            if !convert_to_rgb(src, w as usize, h as usize, stride, fmt, &mut rgb) {
                 warn!(?fmt, "unsupported pixel format");
                 return;
             }
 
-            let t0 = Instant::now();
-            let tj_image = TjImage {
-                pixels: user_data.rgb_scratch.as_slice(),
-                width: w as usize,
-                pitch: w as usize * 3,
-                height: h as usize,
-                format: TjPixelFormat::RGB,
-            };
-            let needed = user_data.compressor.buf_len(w as usize, h as usize).ok();
-            let needed = match needed {
-                Some(n) => n,
-                None => {
-                    warn!("turbojpeg buf_len failed");
-                    return;
+            if user_data.h264_dump.is_none() {
+                if let Some(path) = user_data.h264_dump_path.clone() {
+                    match H264Dump::new(w, h, 30, &path) {
+                        Ok(d) => user_data.h264_dump = Some(d),
+                        Err(e) => {
+                            warn!(error = %e, "H264 dump init failed; disabling");
+                            user_data.h264_dump_path = None;
+                        }
+                    }
                 }
-            };
-            if user_data.jpeg_scratch.len() < needed {
-                user_data.jpeg_scratch.resize(needed, 0);
             }
-            let written = match user_data
-                .compressor
-                .compress_to_slice(tj_image, &mut user_data.jpeg_scratch)
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(error = %e, "turbojpeg compress");
-                    return;
-                }
-            };
-            debug!(
-                ms = t0.elapsed().as_millis() as u64,
-                bytes = written,
-                "encoded jpeg"
-            );
+            if let Some(d) = user_data.h264_dump.as_mut() {
+                d.write_rgb(&rgb);
+            }
 
             let _ = user_data.tx.send(Some(Arc::new(Frame {
-                format: PixelFormat::Jpeg,
                 width: w,
                 height: h,
-                data: user_data.jpeg_scratch[..written].to_vec(),
+                rgb,
             })));
         })
         .register()

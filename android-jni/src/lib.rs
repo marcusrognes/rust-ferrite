@@ -77,6 +77,7 @@ fn do_stream(
                 0
             }
             PixelFormat::Jpeg => 1,
+            PixelFormat::H264 => 2,
         };
 
         // Use a fresh local frame so the jbyteArray is freed each iteration.

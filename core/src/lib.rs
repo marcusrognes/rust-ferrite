@@ -4,8 +4,12 @@ use serde::{Deserialize, Serialize};
 pub enum PixelFormat {
     /// Row-major, 8-bit-per-channel, R,G,B,A byte order per pixel. `data` length = width*height*4.
     Rgba8,
-    /// Standard JPEG bytes. `data` is the encoded byte stream.
+    /// Standard JPEG bytes. `data` is one encoded frame.
     Jpeg,
+    /// H.264 Annex-B byte stream. `data` is an opaque chunk of the continuous
+    /// encoded stream; multiple consecutive chunks must be fed to the decoder in
+    /// order. NAL/AU boundaries may fall anywhere within or across chunks.
+    H264,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
