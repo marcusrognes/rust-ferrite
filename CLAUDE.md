@@ -18,6 +18,10 @@ Cargo workspace (`resolver = "2"`) with three crates plus an Android app:
 ## Build / dev commands
 
 ```bash
+# One-shot: rebuild host + ui + APK, then push & relaunch on connected adb device.
+# Skips install if no device attached. --no-install for build-only.
+./dev.sh
+
 # Build everything for host platform
 cargo build                       # debug
 cargo build --release
@@ -27,6 +31,9 @@ cargo run -p ferrite-host --release
 
 # Run host binary in virtual-monitor mode (requires evdi device — see below)
 FERRITE_MODE=virtual cargo run -p ferrite-host --release
+
+# Run the control panel UI (libcosmic). Spawns ferrite-host as a child.
+cargo run -p ferrite-ui --release
 
 # Build + package Android APK (Rust .so for arm64+x86_64, then gradle assembleDebug)
 ./build-android.sh                # debug APK

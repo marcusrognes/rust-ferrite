@@ -1,5 +1,28 @@
 use serde::{Deserialize, Serialize};
 
+/// Live host status, written by `ferrite-host` to `$XDG_RUNTIME_DIR/ferrite-status.json`
+/// every ~500 ms and read by the UI for display.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Status {
+    pub listen_addr: String,
+    pub mode: String,
+    pub clients: Vec<ClientStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientStatus {
+    pub peer: String,
+    pub width: u32,
+    pub height: u32,
+}
+
+pub fn status_path() -> std::path::PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+        .join("ferrite-status.json")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PixelFormat {
     /// Row-major, 8-bit-per-channel, R,G,B,A byte order per pixel. `data` length = width*height*4.
@@ -23,8 +46,24 @@ pub enum HostMessage {
     Ping,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PointerTool {
+    Finger,
+    Pen,
+    Eraser,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
-    TouchEvent { x: f32, y: f32, pressed: bool },
+    /// Absolute pointer position normalized to `[0, 1]` within the Android view.
+    /// `pressure` is `[0, 1]`. `tool` lets the host decide whether to emit pen
+    /// or finger events on the virtual input device.
+    Pointer {
+        x: f32,
+        y: f32,
+        pressed: bool,
+        pressure: f32,
+        tool: PointerTool,
+    },
     Pong,
 }

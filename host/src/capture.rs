@@ -56,6 +56,12 @@ async fn open_portal() -> Result<(ScStream, OwnedFd)> {
         .create_session(Default::default())
         .await
         .context("create_session")?;
+
+    let cached_token = load_portal_token();
+    if cached_token.is_some() {
+        info!("re-using cached portal restore_token");
+    }
+
     proxy
         .select_sources(
             &session,
@@ -63,8 +69,8 @@ async fn open_portal() -> Result<(ScStream, OwnedFd)> {
                 .set_cursor_mode(CursorMode::Embedded)
                 .set_sources(SourceType::Monitor | SourceType::Window)
                 .set_multiple(false)
-                .set_restore_token(None)
-                .set_persist_mode(PersistMode::DoNot),
+                .set_restore_token(cached_token.as_deref())
+                .set_persist_mode(PersistMode::Application),
         )
         .await
         .context("select_sources")?;
@@ -75,6 +81,11 @@ async fn open_portal() -> Result<(ScStream, OwnedFd)> {
         .context("start")?
         .response()
         .context("start response")?;
+
+    if let Some(tok) = response.restore_token() {
+        save_portal_token(tok);
+    }
+
     let stream_info = response
         .streams()
         .first()
@@ -87,6 +98,32 @@ async fn open_portal() -> Result<(ScStream, OwnedFd)> {
         .context("open_pipe_wire_remote")?;
 
     Ok((stream_info, fd))
+}
+
+fn portal_token_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("ferrite").join("portal_token"))
+}
+
+fn load_portal_token() -> Option<String> {
+    let p = portal_token_path()?;
+    let s = std::fs::read_to_string(&p).ok()?;
+    let t = s.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
+}
+
+fn save_portal_token(token: &str) {
+    let Some(p) = portal_token_path() else { return };
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Err(e) = std::fs::write(&p, token) {
+        warn!(path = %p.display(), error = %e, "could not save portal token");
+    } else {
+        info!(path = %p.display(), "saved portal restore_token");
+    }
 }
 
 struct UserData {

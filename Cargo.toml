@@ -1,3 +1,3 @@
 [workspace]
-members = ["host", "android-jni", "core"]
+members = ["host", "android-jni", "core", "ui"]
 resolver = "2"

@@ -1,10 +1,19 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::{Mutex, OnceLock};
 
-use ferrite_core::{ClientMessage, HostMessage, PixelFormat};
+use ferrite_core::{ClientMessage, HostMessage, PixelFormat, PointerTool};
 use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
-use jni::sys::{jint, jstring};
+use jni::sys::{jboolean, jfloat, jint, jstring};
+
+/// Write-half of the active stream socket, shared with `sendTouch` on the
+/// Kotlin side so it can push `ClientMessage` upstream without opening a
+/// second connection.
+fn tx_sock() -> &'static Mutex<Option<TcpStream>> {
+    static S: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
 
 #[no_mangle]
 pub extern "system" fn Java_com_ferrite_FerriteLib_connect(
@@ -49,6 +58,18 @@ fn do_stream(
 ) -> anyhow::Result<()> {
     let mut sock = TcpStream::connect((host, port))?;
     // No read timeout: host may go idle between frames when nothing changes on screen.
+
+    // Publish a write-half clone so `sendTouch` can push ClientMessages.
+    let writer = sock.try_clone().map_err(|e| anyhow::anyhow!("try_clone: {e}"))?;
+    *tx_sock().lock().unwrap() = Some(writer);
+    // On scope exit (loop breaks via ?), clear the slot so stale writes bail.
+    struct ClearOnDrop;
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            *tx_sock().lock().unwrap() = None;
+        }
+    }
+    let _guard = ClearOnDrop;
 
     loop {
         let buf = read_frame(&mut sock)?;
@@ -101,6 +122,56 @@ fn do_stream(
             }
             Ok(())
         })?;
+    }
+}
+
+/// Force-close the active stream socket. Causes the blocking `stream()` JNI
+/// call to unwind via I/O error so the caller can start a new connection
+/// without waiting for the host to time out.
+#[no_mangle]
+pub extern "system" fn Java_com_ferrite_FerriteLib_disconnect(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    let mut g = tx_sock().lock().unwrap();
+    if let Some(s) = g.take() {
+        let _ = s.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// `tool`: 0 = Finger, 1 = Pen, 2 = Eraser. Anything else is treated as Finger.
+#[no_mangle]
+pub extern "system" fn Java_com_ferrite_FerriteLib_sendPointer(
+    _env: JNIEnv,
+    _class: JClass,
+    x: jfloat,
+    y: jfloat,
+    pressed: jboolean,
+    pressure: jfloat,
+    tool: jint,
+) {
+    let tool = match tool {
+        1 => PointerTool::Pen,
+        2 => PointerTool::Eraser,
+        _ => PointerTool::Finger,
+    };
+    let msg = ClientMessage::Pointer {
+        x: x as f32,
+        y: y as f32,
+        pressed: pressed != 0,
+        pressure: pressure as f32,
+        tool,
+    };
+    let bytes = match bincode::serialize(&msg) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let mut guard = tx_sock().lock().unwrap();
+    if let Some(sock) = guard.as_mut() {
+        let len = (bytes.len() as u32).to_be_bytes();
+        if sock.write_all(&len).is_err() || sock.write_all(&bytes).is_err() {
+            *guard = None;
+        }
     }
 }
 

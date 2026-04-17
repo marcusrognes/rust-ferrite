@@ -1,28 +1,40 @@
 package com.ferrite
 
+import android.content.Context
 import android.media.MediaCodec
 import android.media.MediaFormat
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
 private const val TAG = "ferrite"
-private const val HOST = "10.0.2.2"
-private const val PORT = 7543
+private const val DEFAULT_HOST = "10.0.2.2"
+private const val DEFAULT_PORT = 7543
 private const val MIME = "video/avc"
+private const val PREFS = "ferrite"
+private const val KEY_HOST = "host"
+private const val KEY_PORT = "port"
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback {
     private lateinit var status: TextView
     private lateinit var surfaceView: SurfaceView
+    private var host: String = DEFAULT_HOST
+    private var port: Int = DEFAULT_PORT
 
     private val codecLock = Any()
     private var codec: MediaCodec? = null
@@ -38,20 +50,76 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        host = prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST
+        port = prefs.getInt(KEY_PORT, DEFAULT_PORT)
+
         status = TextView(this).apply {
             textSize = 14f
             gravity = Gravity.CENTER
-            text = "waiting for surface..."
+            text = "$host:$port"
+        }
+        val scanBtn = Button(this).apply {
+            text = "Scan QR"
+            setOnClickListener { scanQr() }
+        }
+        val toolbar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(status, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            addView(scanBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(this@MainActivity)
+            setOnTouchListener { v, e -> handleTouch(v.width, v.height, e) }
         }
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+            addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
             addView(surfaceView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         }
         setContentView(root)
+    }
+
+    private fun scanQr() {
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .build()
+        val scanner = GmsBarcodeScanning.getClient(this, options)
+        scanner.startScan()
+            .addOnSuccessListener { barcode ->
+                val raw = barcode.rawValue ?: return@addOnSuccessListener
+                handleScan(raw)
+            }
+            .addOnFailureListener { e ->
+                Log.w(TAG, "scan failed", e)
+                status.text = "scan err: ${e.message}"
+            }
+            .addOnCanceledListener {
+                Log.i(TAG, "scan canceled")
+            }
+    }
+
+    private fun handleScan(raw: String) {
+        val uri = try { Uri.parse(raw) } catch (e: Throwable) {
+            status.text = "bad QR: $raw"
+            return
+        }
+        val newHost = uri.host
+        if (newHost.isNullOrEmpty()) {
+            status.text = "QR has no host: $raw"
+            return
+        }
+        val newPort = if (uri.port > 0) uri.port else DEFAULT_PORT
+
+        getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(KEY_HOST, newHost)
+            .putInt(KEY_PORT, newPort)
+            .apply()
+
+        // Tear down current connection so the recreate gets a clean state.
+        try { FerriteLib.disconnect() } catch (_: Throwable) {}
+        recreate()
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {
@@ -73,10 +141,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
 
     private fun startStreamIfNeeded() {
         if (streamStarted.compareAndSet(false, true)) {
-            runOnUiThread { status.text = "connecting $HOST:$PORT..." }
+            val h = host
+            val p = port
+            runOnUiThread { status.text = "connecting $h:$p..." }
             Thread(null, {
                 try {
-                    FerriteLib.stream(HOST, PORT, this)
+                    FerriteLib.stream(h, p, this)
                 } catch (e: Throwable) {
                     Log.e(TAG, "stream error", e)
                     runOnUiThread { status.text = "err: ${e.message}" }
@@ -159,6 +229,30 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
                 else -> {} // INFO_TRY_AGAIN_LATER or deprecated
             }
         }
+    }
+
+    private fun handleTouch(viewW: Int, viewH: Int, e: MotionEvent): Boolean {
+        if (viewW <= 0 || viewH <= 0) return false
+        val x = (e.x / viewW).coerceIn(0f, 1f)
+        val y = (e.y / viewH).coerceIn(0f, 1f)
+        val pressed = when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> true
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> false
+            else -> return false
+        }
+        // pressure: stylus reports real values; finger usually reports 1.0 when down.
+        val pressure = e.pressure.coerceIn(0f, 1f)
+        val tool = when (e.getToolType(0)) {
+            MotionEvent.TOOL_TYPE_STYLUS -> 1   // PointerTool::Pen
+            MotionEvent.TOOL_TYPE_ERASER -> 2   // PointerTool::Eraser
+            else -> 0                            // PointerTool::Finger
+        }
+        try {
+            FerriteLib.sendPointer(x, y, pressed, pressure, tool)
+        } catch (t: Throwable) {
+            Log.w(TAG, "sendPointer failed", t)
+        }
+        return true
     }
 
     private fun stopCodec() {

@@ -23,4 +23,19 @@ object FerriteLib {
      * Throws RuntimeException on I/O or protocol error.
      */
     external fun stream(host: String, port: Int, cb: FrameCallback)
+
+    /**
+     * Push a pointer event to the host over the currently-active `stream()`
+     * socket. `x, y` ∈ [0,1] within the view; `pressure` ∈ [0,1]; `tool` is
+     * 0=Finger, 1=Pen, 2=Eraser. No-op if there's no live stream.
+     */
+    external fun sendPointer(
+        x: Float, y: Float,
+        pressed: Boolean,
+        pressure: Float,
+        tool: Int,
+    )
+
+    /** Aborts the current `stream()` blocking call by closing the socket. */
+    external fun disconnect()
 }
