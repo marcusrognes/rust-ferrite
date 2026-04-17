@@ -1,6 +1,7 @@
 mod capture;
 mod h264_dump;
 mod h264_stream;
+mod virtual_display;
 
 use anyhow::{Context, Result};
 use capture::{FrameRx, start as start_capture};
@@ -21,8 +22,22 @@ async fn main() -> Result<()> {
 
     let (tx, rx) = watch::channel(None);
 
-    if let Err(e) = start_capture(tx).await {
-        warn!(error = %e, "screen capture failed to start; host has nothing to stream");
+    let mode = std::env::var("FERRITE_MODE").unwrap_or_else(|_| "mirror".into());
+    match mode.as_str() {
+        "virtual" => {
+            if let Err(e) = virtual_display::start(tx) {
+                warn!(error = %e, "virtual display failed to start; host has nothing to stream");
+            } else {
+                info!("FERRITE_MODE=virtual: evdi virtual monitor started");
+            }
+        }
+        _ => {
+            if let Err(e) = start_capture(tx).await {
+                warn!(error = %e, "screen capture failed to start; host has nothing to stream");
+            } else {
+                info!("FERRITE_MODE=mirror: portal/pipewire capture started");
+            }
+        }
     }
 
     let listener = TcpListener::bind(ADDR)

@@ -335,6 +335,7 @@ dependencies = [
  "ashpd",
  "bincode",
  "ferrite-core",
+ "libc",
  "pipewire",
  "tokio",
  "tracing",
