@@ -1,0 +1,12 @@
+[package]
+name = "ferrite-host"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ferrite-core = { path = "../core" }
+tokio = { version = "1", features = ["full"] }
+bincode = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"

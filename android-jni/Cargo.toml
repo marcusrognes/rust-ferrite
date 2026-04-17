@@ -1,0 +1,15 @@
+[package]
+name = "ferrite-android"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "ferrite_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+ferrite-core = { path = "../core" }
+tokio = { version = "1", features = ["full"] }
+jni = "0.21"
+bincode = "1"
+anyhow = "1"
