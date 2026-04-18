@@ -301,6 +301,13 @@ async fn pump_rgb(mut rgb_rx: FrameRx, mut stdin: tokio::process::ChildStdin) ->
     // Skip feeding ffmpeg when the captured pixels are unchanged from the
     // previous frame — saves the encoder + network the trip on idle screens.
     // xxh3 hashes ~15GB/s so a 2800x1720 RGB frame costs ~1ms.
+    //
+    // But never go fully idle: ffmpeg needs input flowing to emit IDRs
+    // (and Android's MediaCodec needs an IDR to configure). If nothing
+    // changes for >500ms, re-send the latest frame as a heartbeat so the
+    // encoder keeps producing output. Unchanged content compresses to
+    // near-zero P-frames, so the bandwidth cost is negligible.
+    const IDLE_HEARTBEAT: Duration = Duration::from_millis(500);
     let mut last_hash: Option<u64> = None;
     loop {
         let frame = rgb_rx.borrow_and_update().clone();
@@ -311,7 +318,18 @@ async fn pump_rgb(mut rgb_rx: FrameRx, mut stdin: tokio::process::ChildStdin) ->
                 last_hash = Some(h);
             }
         }
-        rgb_rx.changed().await.context("capture source ended")?;
+        tokio::select! {
+            r = rgb_rx.changed() => r.context("capture source ended")?,
+            _ = tokio::time::sleep(IDLE_HEARTBEAT) => {
+                // No new frame within the heartbeat window; resend the
+                // current one to keep the ffmpeg pipeline alive. Clone
+                // first so we don't hold the watch ref across the await.
+                let frame = rgb_rx.borrow().clone();
+                if let Some(frame) = frame {
+                    stdin.write_all(&frame.rgb).await?;
+                }
+            }
+        }
     }
 }
 
