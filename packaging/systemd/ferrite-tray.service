@@ -1,0 +1,13 @@
+[Unit]
+Description=Ferrite tray (Android-as-external-display)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/ferrite-tray
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

@@ -53,19 +53,7 @@ A new `cardN` will appear in `/dev/dri/`. COSMIC will see it as a "22.6\" DVI-I-
 
 ### AOA udev rule
 
-For the AOA transport to work without `sudo`, install a udev rule granting your user access to devices in Android accessory mode. Example (ship this via your distro packaging):
-
-```
-# /etc/udev/rules.d/51-ferrite-aoa.rules
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d00", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d01", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d02", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d03", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d04", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", ATTR{idProduct}=="2d05", MODE="0660", TAG+="uaccess"
-```
-
-Then `sudo udevadm control --reload && sudo udevadm trigger`.
+For the AOA transport to work without `sudo`, install the udev rule at [`packaging/51-ferrite-aoa.rules`](packaging/51-ferrite-aoa.rules) — the `install.sh` script below does this for you.
 
 ## Build
 
@@ -81,9 +69,25 @@ cargo build --release                  # all Rust crates
 
 The APK lands at `android-app/app/build/outputs/apk/debug/app-debug.apk`. Install with `adb install -r`.
 
+## Install
+
+```bash
+cargo build --release
+./packaging/install.sh
+```
+
+This copies the three binaries into `~/.local/bin`, adds an XDG autostart entry, and installs the AOA udev rule (needs `sudo` for the udev step).
+
+For a systemd-managed tray instead of XDG autostart:
+
+```bash
+install -m 0644 packaging/systemd/ferrite-tray.service ~/.config/systemd/user/
+systemctl --user enable --now ferrite-tray.service
+```
+
 ## Run
 
-Autostart `ferrite-tray` at login. It spawns `ferrite-host` and owns its lifecycle; the tray menu toggles enable/disable and switches between mirror and virtual mode.
+The tray owns `ferrite-host` and exposes enable/disable + mirror/virtual toggle in the menu. Normally this just autostarts at login.
 
 ```bash
 ./target/release/ferrite-tray          # normal entry point
