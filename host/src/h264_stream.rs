@@ -37,12 +37,27 @@ impl H264Encoder {
             "format=nv12,hwupload",
             "-c:v",
             "h264_vaapi",
-            "-b:v",
-            "8M",
+            // CQP avoids the rate-control feedback loop's frame buffering, so
+            // the encoder's pipeline depth bottoms out. Bitrate becomes variable
+            // (spikes on motion) but we'd rather pay bandwidth than ms.
+            "-rc_mode",
+            "CQP",
+            "-qp",
+            "22",
+            "-quality",
+            "7", // fastest VAAPI preset (1=best quality, 7=fastest)
             "-g",
-            "60",
+            &(fps / 2).max(1).to_string(), // IDR every ~0.5s for fast recovery
             "-bf",
             "0",
+            "-async_depth",
+            "1",
+            "-aud",
+            "1", // emit AUD NAL so we can split the stream into AUs cleanly
+            "-bsf:v",
+            // Prepend SPS/PPS to every IDR so the decoder can resync without
+            // waiting for a full GOP cycle if it loses parameter state.
+            "dump_extra=freq=keyframe",
             "-f",
             "h264",
             "pipe:1",

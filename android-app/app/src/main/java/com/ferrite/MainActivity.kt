@@ -32,16 +32,19 @@ private const val KEY_PORT = "port"
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback {
     private lateinit var status: TextView
+    private lateinit var welcome: LinearLayout
     private lateinit var surfaceView: SurfaceView
     private var host: String = DEFAULT_HOST
     private var port: Int = DEFAULT_PORT
+    private val streaming = AtomicBoolean(false)
 
     private val codecLock = Any()
     private var codec: MediaCodec? = null
     private var outputThread: Thread? = null
     private val running = AtomicBoolean(false)
     private val surfaceReady = AtomicBoolean(false)
-    private val streamStarted = AtomicBoolean(false)
+    private val streamLoopActive = AtomicBoolean(false)
+    @Volatile private var streamLoopShouldRun = false
 
     private val bytesIn = AtomicLong(0)
     private val framesRendered = AtomicLong(0)
@@ -50,35 +53,84 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        supportActionBar?.hide()
 
         val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         host = prefs.getString(KEY_HOST, DEFAULT_HOST) ?: DEFAULT_HOST
         port = prefs.getInt(KEY_PORT, DEFAULT_PORT)
 
+        // Welcome screen — shown when not streaming. Big "Ferrite" title,
+        // status line, scan-QR button. Hidden while streaming so the surface
+        // gets the full window.
+        val title = TextView(this).apply {
+            text = "Ferrite"
+            textSize = 48f
+            gravity = Gravity.CENTER
+        }
         status = TextView(this).apply {
+            textSize = 18f
+            gravity = Gravity.CENTER
+            text = "starting..."
+        }
+        val savedTarget = TextView(this).apply {
             textSize = 14f
             gravity = Gravity.CENTER
-            text = "$host:$port"
+            text = "saved Wi-Fi target: $host:$port\nor plug in USB"
+            alpha = 0.6f
         }
         val scanBtn = Button(this).apply {
             text = "Scan QR"
             setOnClickListener { scanQr() }
         }
-        val toolbar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            addView(status, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        welcome = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(48, 48, 48, 48)
+            addView(title, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+                .apply { bottomMargin = 32 })
+            addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+                .apply { bottomMargin = 16 })
+            addView(savedTarget, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
+                .apply { bottomMargin = 32 })
             addView(scanBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
+
+        // SurfaceView must stay VISIBLE for the underlying surface to exist;
+        // we just stack the welcome layout on top while not streaming and
+        // hide the welcome once frames start arriving.
         surfaceView = SurfaceView(this).apply {
             holder.addCallback(this@MainActivity)
             setOnTouchListener { v, e -> handleTouch(v.width, v.height, e) }
+            setOnHoverListener { v, e -> handleHover(v.width, v.height, e) }
+            setOnGenericMotionListener { v, e -> handleHover(v.width, v.height, e) }
         }
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            addView(toolbar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
-            addView(surfaceView, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+
+        val root = android.widget.FrameLayout(this).apply {
+            addView(surfaceView, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
+            addView(welcome, android.widget.FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         }
         setContentView(root)
+    }
+
+    private fun setStreamingUi(on: Boolean) {
+        if (!streaming.compareAndSet(!on, on)) return
+        runOnUiThread {
+            welcome.visibility = if (on) android.view.View.GONE else android.view.View.VISIBLE
+            applyImmersive(on)
+        }
+    }
+
+    private fun applyImmersive(on: Boolean) {
+        val controller = androidx.core.view.WindowCompat.getInsetsController(window, window.decorView)
+        if (on) {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, false)
+            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            controller.systemBarsBehavior =
+                androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+        } else {
+            androidx.core.view.WindowCompat.setDecorFitsSystemWindows(window, true)
+            controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+        }
     }
 
     private fun scanQr() {
@@ -117,8 +169,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             .putInt(KEY_PORT, newPort)
             .apply()
 
-        // Tear down current connection so the recreate gets a clean state.
-        try { FerriteLib.disconnect() } catch (_: Throwable) {}
+        // Tear down current connection + loop so the recreate gets a clean state.
+        stopStreamLoop()
         recreate()
     }
 
@@ -136,22 +188,67 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
 
     override fun onDestroy() {
         super.onDestroy()
+        stopStreamLoop()
         stopCodec()
     }
 
     private fun startStreamIfNeeded() {
-        if (streamStarted.compareAndSet(false, true)) {
-            val h = host
-            val p = port
-            runOnUiThread { status.text = "connecting $h:$p..." }
-            Thread(null, {
-                try {
-                    FerriteLib.stream(h, p, this)
-                } catch (e: Throwable) {
-                    Log.e(TAG, "stream error", e)
-                    runOnUiThread { status.text = "err: ${e.message}" }
+        if (!streamLoopActive.compareAndSet(false, true)) return
+        streamLoopShouldRun = true
+        val name = "${android.os.Build.MANUFACTURER} ${android.os.Build.MODEL}".trim()
+        val metrics = resources.displayMetrics
+        val w = metrics.widthPixels
+        val ht = metrics.heightPixels
+        Thread(null, {
+            try {
+                while (streamLoopShouldRun) {
+                    val savedHost = host
+                    val savedPort = port
+                    // Re-probe each iteration so plugging in USB or starting
+                    // the host afterwards is picked up automatically.
+                    val target = when {
+                        probeReachable("127.0.0.1", DEFAULT_PORT, 300) ->
+                            "127.0.0.1" to DEFAULT_PORT
+                        probeReachable(savedHost, savedPort, 500) ->
+                            savedHost to savedPort
+                        else -> null
+                    }
+                    if (target == null) {
+                        runOnUiThread { status.text = "waiting for host..." }
+                        Thread.sleep(2000)
+                        continue
+                    }
+                    val (h, p) = target
+                    runOnUiThread { status.text = "connecting $h:$p..." }
+                    try {
+                        FerriteLib.stream(h, p, name, w, ht, this)
+                        runOnUiThread { status.text = "disconnected, retrying..." }
+                    } catch (e: Throwable) {
+                        Log.w(TAG, "stream ended: ${e.message}")
+                        runOnUiThread { status.text = "err: ${e.message}, retrying..." }
+                    }
+                    setStreamingUi(false)
+                    if (streamLoopShouldRun) Thread.sleep(1500)
                 }
-            }, "ferrite-stream").start()
+            } finally {
+                streamLoopActive.set(false)
+            }
+        }, "ferrite-stream").start()
+    }
+
+    private fun stopStreamLoop() {
+        streamLoopShouldRun = false
+        try { FerriteLib.disconnect() } catch (_: Throwable) {}
+    }
+
+    private fun probeReachable(host: String, port: Int, timeoutMs: Int): Boolean {
+        return try {
+            java.net.Socket().use { s ->
+                s.connect(java.net.InetSocketAddress(host, port), timeoutMs)
+                true
+            }
+        } catch (_: Throwable) {
+            false
         }
     }
 
@@ -161,16 +258,29 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             Log.w(TAG, "unsupported format $format")
             return
         }
+        setStreamingUi(true)
         synchronized(codecLock) {
             if (!surfaceReady.get()) return
             val c = codec ?: createCodecLocked(width, height) ?: return
-            val idx = try {
-                c.dequeueInputBuffer(20_000L)
-            } catch (e: IllegalStateException) {
-                Log.e(TAG, "dequeueInputBuffer failed", e)
+            // Retry briefly if the decoder hasn't returned an input buffer yet.
+            // Dropping a chunk here corrupts the H.264 stream and produces
+            // visible artifacts until the next IDR. We'd rather backpressure
+            // the network reader (which back-pressures TCP and the host
+            // encoder) than lose data.
+            var idx = -1
+            val deadlineNs = System.nanoTime() + 200_000_000L // 200 ms
+            while (idx < 0 && System.nanoTime() < deadlineNs) {
+                idx = try {
+                    c.dequeueInputBuffer(20_000L)
+                } catch (e: IllegalStateException) {
+                    Log.e(TAG, "dequeueInputBuffer failed", e)
+                    return
+                }
+            }
+            if (idx < 0) {
+                Log.w(TAG, "decoder input buffer unavailable after 200ms; dropping ${data.size}B")
                 return
             }
-            if (idx < 0) return
             val buf = c.getInputBuffer(idx) ?: return
             buf.clear()
             buf.put(data)
@@ -185,6 +295,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             if (!holder.surface.isValid) return null
             val c = MediaCodec.createDecoderByType(MIME)
             val fmt = MediaFormat.createVideoFormat(MIME, width, height)
+            // KEY_LOW_LATENCY hint (API 30+); harmless on older devices.
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                fmt.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+            }
             c.configure(fmt, holder.surface, null, 0)
             c.start()
             codec = c
@@ -240,19 +354,35 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> false
             else -> return false
         }
-        // pressure: stylus reports real values; finger usually reports 1.0 when down.
         val pressure = e.pressure.coerceIn(0f, 1f)
-        val tool = when (e.getToolType(0)) {
-            MotionEvent.TOOL_TYPE_STYLUS -> 1   // PointerTool::Pen
-            MotionEvent.TOOL_TYPE_ERASER -> 2   // PointerTool::Eraser
-            else -> 0                            // PointerTool::Finger
-        }
+        val tool = toolFor(e)
         try {
-            FerriteLib.sendPointer(x, y, pressed, pressure, tool)
+            FerriteLib.sendPointer(x, y, pressed, pressure, tool, true)
         } catch (t: Throwable) {
             Log.w(TAG, "sendPointer failed", t)
         }
         return true
+    }
+
+    // S-Pen sends ACTION_HOVER_* while in proximity but not touching.
+    private fun handleHover(viewW: Int, viewH: Int, e: MotionEvent): Boolean {
+        if (viewW <= 0 || viewH <= 0) return false
+        val x = (e.x / viewW).coerceIn(0f, 1f)
+        val y = (e.y / viewH).coerceIn(0f, 1f)
+        val inRange = e.actionMasked != MotionEvent.ACTION_HOVER_EXIT
+        val tool = toolFor(e)
+        try {
+            FerriteLib.sendPointer(x, y, false, 0f, tool, inRange)
+        } catch (t: Throwable) {
+            Log.w(TAG, "sendPointer hover failed", t)
+        }
+        return true
+    }
+
+    private fun toolFor(e: MotionEvent): Int = when (e.getToolType(0)) {
+        MotionEvent.TOOL_TYPE_STYLUS -> 1
+        MotionEvent.TOOL_TYPE_ERASER -> 2
+        else -> 0
     }
 
     private fun stopCodec() {

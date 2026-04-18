@@ -55,15 +55,28 @@ pub enum PointerTool {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
+    /// First message after socket connect. `device_name` is shown in cosmic's
+    /// display list (via EDID monitor-name descriptor in virtual mode) and
+    /// suffixed onto the per-client pen device name. `width` / `height` are
+    /// the client's screen pixels; in virtual mode the host creates an evdi
+    /// monitor at exactly those dimensions.
+    Hello {
+        device_name: String,
+        width: u32,
+        height: u32,
+    },
     /// Absolute pointer position normalized to `[0, 1]` within the Android view.
     /// `pressure` is `[0, 1]`. `tool` lets the host decide whether to emit pen
-    /// or finger events on the virtual input device.
+    /// or finger events on the virtual input device. `in_range` distinguishes
+    /// "tool present but lifted" (pen hover) from "tool gone"; finger always
+    /// reports `true` since capacitive screens have no proximity.
     Pointer {
         x: f32,
         y: f32,
         pressed: bool,
         pressure: f32,
         tool: PointerTool,
+        in_range: bool,
     },
     Pong,
 }

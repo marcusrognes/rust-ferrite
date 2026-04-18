@@ -1,6 +1,7 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use ferrite_core::{ClientMessage, HostMessage, PixelFormat, PointerTool};
 use jni::JNIEnv;
@@ -23,17 +24,21 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_connect(
     env.new_string("ferrite-android ready").unwrap().into_raw()
 }
 
-/// Opens a TCP connection to `host:port` and then loops forever, reading length-
-/// prefixed `bincode` `HostMessage::VideoFrame`s and calling `callback.onFrame(
-/// byte[], int, int)` for each frame. Blocks the caller until the connection
-/// errors or the callback throws. Throws `java.lang.RuntimeException` on any
-/// I/O / protocol / JNI error.
+/// Opens a TCP connection to `host:port`, sends `Hello` (so the host can size
+/// its virtual monitor + name our input devices), and then loops forever
+/// reading length-prefixed `bincode` `HostMessage::VideoFrame`s, calling
+/// `callback.onFrame(byte[], int, int, int)` for each frame. Blocks the caller
+/// until the connection errors or the callback throws. Throws
+/// `java.lang.RuntimeException` on any I/O / protocol / JNI error.
 #[no_mangle]
 pub extern "system" fn Java_com_ferrite_FerriteLib_stream<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     host: JString<'l>,
     port: jint,
+    device_name: JString<'l>,
+    width: jint,
+    height: jint,
     callback: JObject<'l>,
 ) {
     let host_str: String = match env.get_string(&host) {
@@ -43,7 +48,22 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_stream<'l>(
             return;
         }
     };
-    if let Err(e) = do_stream(&mut env, &host_str, port as u16, &callback) {
+    let name_str: String = match env.get_string(&device_name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("bad device_name: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = do_stream(
+        &mut env,
+        &host_str,
+        port as u16,
+        &name_str,
+        width as u32,
+        height as u32,
+        &callback,
+    ) {
         if !env.exception_check().unwrap_or(false) {
             let _ = env.throw_new("java/lang/RuntimeException", format!("{e:#}"));
         }
@@ -54,14 +74,34 @@ fn do_stream(
     env: &mut JNIEnv,
     host: &str,
     port: u16,
+    device_name: &str,
+    width: u32,
+    height: u32,
     callback: &JObject,
 ) -> anyhow::Result<()> {
     let mut sock = TcpStream::connect((host, port))?;
-    // No read timeout: host may go idle between frames when nothing changes on screen.
+    // No read timeout: host may go idle between frames when nothing changes on
+    // screen. But enable TCP keepalive so the kernel detects a dead connection
+    // (e.g. USB cable yanked) within ~10s instead of the default ~2 hours.
+    let sock2 = socket2::SockRef::from(&sock);
+    let _ = sock2.set_keepalive(true);
+    let _ = sock2.set_tcp_keepalive(
+        &socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(5))
+            .with_interval(Duration::from_secs(2)),
+    );
 
     // Publish a write-half clone so `sendTouch` can push ClientMessages.
     let writer = sock.try_clone().map_err(|e| anyhow::anyhow!("try_clone: {e}"))?;
     *tx_sock().lock().unwrap() = Some(writer);
+
+    // Hello drives host-side monitor sizing + device naming.
+    let hello = bincode::serialize(&ClientMessage::Hello {
+        device_name: device_name.to_string(),
+        width,
+        height,
+    })?;
+    write_frame(&mut sock, &hello)?;
     // On scope exit (loop breaks via ?), clear the slot so stale writes bail.
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
@@ -149,6 +189,7 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_sendPointer(
     pressed: jboolean,
     pressure: jfloat,
     tool: jint,
+    in_range: jboolean,
 ) {
     let tool = match tool {
         1 => PointerTool::Pen,
@@ -161,6 +202,7 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_sendPointer(
         pressed: pressed != 0,
         pressure: pressure as f32,
         tool,
+        in_range: in_range != 0,
     };
     let bytes = match bincode::serialize(&msg) {
         Ok(b) => b,

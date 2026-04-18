@@ -7,6 +7,28 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
+print_next_steps() {
+    cat <<'EOF'
+
+==> next steps:
+
+  # mirror an existing display (default):
+  ./target/release/ferrite-host
+
+  # virtual monitor mode (needs evdi loaded):
+  sudo modprobe evdi && echo 1 | sudo tee /sys/devices/evdi/add
+  FERRITE_MODE=virtual ./target/release/ferrite-host
+
+  # control panel UI (spawns host as child):
+  ./target/release/ferrite-ui
+
+  # USB transport (instead of Wi-Fi):
+  adb reverse tcp:7543 tcp:7543
+
+EOF
+}
+trap 'rc=$?; [[ $rc -eq 0 ]] && print_next_steps' EXIT
+
 NO_INSTALL=0
 for arg in "$@"; do
     case "$arg" in
@@ -57,4 +79,4 @@ echo "==> relaunching com.ferrite/.MainActivity"
 "$ADB" shell am force-stop com.ferrite
 "$ADB" shell am start -n com.ferrite/.MainActivity >/dev/null
 
-echo "==> done. host: ./target/release/ferrite-host  |  ui: ./target/release/ferrite-ui"
+echo "==> done."

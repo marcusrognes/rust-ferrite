@@ -1,17 +1,19 @@
 //! Virtual monitor via `evdi` kernel module.
 //!
-//! `start()` creates a new evdi device, connects it with a fake EDID, and spawns
-//! an OS thread that runs the evdi event loop. The compositor (COSMIC) sees the
-//! device as a real monitor and the user can place it in Display settings.
-//! Framebuffer updates from the compositor are converted to RGB and published
-//! on the existing `FrameTx` watch channel.
+//! `start(width, height, name, tx)` creates a new evdi device, connects it with
+//! an EDID built for the given size + monitor-name, and spawns an OS thread
+//! that runs the evdi event loop. The compositor (COSMIC) sees the device as a
+//! real monitor and the user can place it in Display settings. Framebuffer
+//! updates from the compositor are converted to RGB and published on the given
+//! `FrameTx` watch channel. Drop the returned handle to "unplug" the monitor.
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 
 use anyhow::{Context, Result, bail};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::capture::{Frame, FrameTx};
 
@@ -114,35 +116,90 @@ unsafe extern "C" {
     fn evdi_get_event_ready(handle: *mut c_void) -> i32;
 }
 
-// First 124 bytes of a 1920x1080 @ 60Hz EDID (Linux FHD layout). Missing trailing
-// monitor-name padding (2 bytes), extension-count (1 byte), and checksum (1
-// byte) — filled in at runtime in `edid_1080p()`.
-#[rustfmt::skip]
-const EDID_BASE: [u8; 124] = [
-    0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
-    0x31, 0xd8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x05, 0x16, 0x01, 0x03, 0x6d, 0x32, 0x1c, 0x78,
-    0xea, 0x5e, 0xc0, 0xa4, 0x59, 0x4a, 0x98, 0x25,
-    0x20, 0x50, 0x54, 0x00, 0x00, 0x00, 0xd1, 0xc0,
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
-    0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x02, 0x3a,
-    0x80, 0x18, 0x71, 0x38, 0x2d, 0x40, 0x58, 0x2c,
-    0x45, 0x00, 0xf4, 0x19, 0x11, 0x00, 0x00, 0x1e,
-    0x00, 0x00, 0x00, 0xff, 0x00, 0x4c, 0x69, 0x6e,
-    0x75, 0x78, 0x20, 0x23, 0x30, 0x0a, 0x20, 0x20,
-    0x20, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b, 0x3d,
-    0x42, 0x42, 0x1e, 0x0a, 0x20, 0x20, 0x20, 0x20,
-    0x20, 0x20, 0x00, 0x00, 0x00, 0xfc, 0x00, 0x4c,
-    0x69, 0x6e, 0x75, 0x78, 0x20, 0x46, 0x48, 0x44,
-    0x0a, 0x20, 0x20, 0x20,
-];
-
-fn edid_1080p() -> [u8; 128] {
+fn build_edid(width: u32, height: u32, name: &str) -> [u8; 128] {
     let mut out = [0u8; 128];
-    out[..124].copy_from_slice(&EDID_BASE);
-    out[124] = 0x20; // finish monitor-name padding ("   ")
-    out[125] = 0x20;
-    out[126] = 0; // no extension blocks
+    // Header (bytes 0..8)
+    out[0..8].copy_from_slice(&[0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00]);
+    // Manufacturer "LNX" (bytes 8..10)
+    out[8] = 0x31;
+    out[9] = 0xd8;
+    // Product (10..12), serial (12..16), week/year (16..18)
+    out[16] = 0x05;
+    out[17] = 0x16;
+    // EDID version 1.3 (18..20)
+    out[18] = 0x01;
+    out[19] = 0x03;
+    // Basic display params: digital, max H/V cm, gamma, features (20..25)
+    out[20] = 0x6d;
+    out[21] = 0x32;
+    out[22] = 0x1c;
+    out[23] = 0x78;
+    out[24] = 0xea;
+    // Chromaticity (25..35)
+    out[25..35].copy_from_slice(&[0x5e, 0xc0, 0xa4, 0x59, 0x4a, 0x98, 0x25, 0x20, 0x50, 0x54]);
+    // Established timings (35..38) — none required
+    out[35] = 0x00;
+    out[36] = 0x00;
+    out[37] = 0x00;
+    // Standard timings (38..54) — all 0x0101 = unused
+    for i in 0..8 {
+        out[38 + i * 2] = 0x01;
+        out[39 + i * 2] = 0x01;
+    }
+
+    // Detailed timing 1 (preferred mode) at bytes 54..72.
+    let h_blank = (((width / 8) + 1) & !1).max(2);
+    let v_blank = (height / 20).max(2);
+    let total = (width as u64 + h_blank as u64) * (height as u64 + v_blank as u64);
+    let pixel_clock_10khz = (total * 60 / 10_000) as u32;
+    out[54] = (pixel_clock_10khz & 0xff) as u8;
+    out[55] = ((pixel_clock_10khz >> 8) & 0xff) as u8;
+    out[56] = (width & 0xff) as u8;
+    out[57] = (h_blank & 0xff) as u8;
+    out[58] = (((width >> 4) & 0xf0) | ((h_blank >> 8) & 0x0f)) as u8;
+    out[59] = (height & 0xff) as u8;
+    out[60] = (v_blank & 0xff) as u8;
+    out[61] = (((height >> 4) & 0xf0) | ((v_blank >> 8) & 0x0f)) as u8;
+    let h_sync_off = (h_blank / 4).max(1);
+    let h_sync_width = (h_blank / 2).max(1);
+    out[62] = (h_sync_off & 0xff) as u8;
+    out[63] = (h_sync_width & 0xff) as u8;
+    out[64] = (3u8 << 4) | 5; // VSyncOff=3, VSyncWidth=5
+    out[65] = ((((h_sync_off >> 8) & 0x3) << 6) | (((h_sync_width >> 8) & 0x3) << 4)) as u8;
+    let h_size_mm: u32 = 300;
+    let v_size_mm: u32 = 300 * height / width.max(1);
+    out[66] = (h_size_mm & 0xff) as u8;
+    out[67] = (v_size_mm & 0xff) as u8;
+    out[68] = (((h_size_mm >> 4) & 0xf0) | ((v_size_mm >> 8) & 0x0f)) as u8;
+    out[69] = 0;
+    out[70] = 0;
+    out[71] = 0x18; // digital separate sync, +H, +V
+
+    // Descriptor 2 (72..90): 0xff display product serial = "Linux #0"
+    out[72..90].copy_from_slice(&[
+        0x00, 0x00, 0x00, 0xff, 0x00, b'L', b'i', b'n', b'u', b'x', b' ', b'#', b'0', 0x0a, 0x20,
+        0x20, 0x20, 0x20,
+    ]);
+    // Descriptor 3 (90..108): 0xfd display range limits
+    out[90..108].copy_from_slice(&[
+        0x00, 0x00, 0x00, 0xfd, 0x00, 0x3b, 0x3d, 0x42, 0x42, 0x1e, 0x0a, 0x20, 0x20, 0x20, 0x20,
+        0x20, 0x20, 0x20,
+    ]);
+    // Descriptor 4 (108..126): 0xfc monitor name
+    out[108] = 0x00;
+    out[109] = 0x00;
+    out[110] = 0x00;
+    out[111] = 0xfc;
+    out[112] = 0x00;
+    out[113..126].fill(0x20);
+    let bytes = name.as_bytes();
+    let take = bytes.len().min(13);
+    out[113..113 + take].copy_from_slice(&bytes[..take]);
+    if take < 13 {
+        out[113 + take] = 0x0a;
+    }
+
+    out[126] = 0;
     let sum: u32 = out[..127].iter().map(|&b| b as u32).sum();
     out[127] = (256u32.wrapping_sub(sum & 0xff) & 0xff) as u8;
     out
@@ -264,7 +321,23 @@ fn bgra_to_rgb(src: &[u8], w: usize, h: usize, stride: usize, dst: &mut [u8]) {
     }
 }
 
-pub fn start(tx: FrameTx) -> Result<()> {
+/// Drop to "unplug" the virtual monitor — the evdi loop exits, the handle is
+/// disconnected and closed, and cosmic sees the output disappear.
+pub struct VirtualDisplayHandle {
+    stop: Arc<AtomicBool>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for VirtualDisplayHandle {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
+        }
+    }
+}
+
+pub fn start(width: u32, height: u32, name: &str, tx: FrameTx) -> Result<VirtualDisplayHandle> {
     // Find an already-created evdi device (adding one requires root — user does
     // it once via sudo; see README/setup notes).
     let mut device = -1;
@@ -292,16 +365,16 @@ pub fn start(tx: FrameTx) -> Result<()> {
              echo 1 | sudo tee /sys/devices/evdi/add"
         );
     }
-    info!(device, "found evdi device");
+    info!(device, width, height, name, "opening evdi device");
 
     let handle = unsafe { evdi_open(device) };
     if handle.is_null() {
         bail!("evdi_open({}) failed — check /dev/dri/card* permissions", device);
     }
 
-    let edid = edid_1080p();
+    let edid = build_edid(width, height, name);
     unsafe { evdi_connect(handle, edid.as_ptr(), edid.len() as u32, 0) };
-    info!("evdi_connect sent EDID (128 bytes)");
+    info!(name, "evdi_connect sent EDID (128 bytes)");
 
     let state = Box::new(State {
         tx,
@@ -317,17 +390,19 @@ pub fn start(tx: FrameTx) -> Result<()> {
     });
     let state_ptr = Box::into_raw(state);
 
+    let stop = Arc::new(AtomicBool::new(false));
     // Rust 2021 disjoint captures won't let us move raw pointers into a thread
     // closure even through a Send newtype (it decomposes to fields). Shuttle
     // them across as `usize`, which is trivially Send, and cast back inside.
     let handle_addr = handle as usize;
     let state_addr = state_ptr as usize;
-    thread::Builder::new()
+    let stop_for_thread = stop.clone();
+    let join = thread::Builder::new()
         .name("evdi-capture".into())
         .spawn(move || {
             let h = handle_addr as *mut c_void;
             let s = state_addr as *mut State;
-            run_loop(h, s);
+            run_loop(h, s, stop_for_thread);
             unsafe {
                 evdi_disconnect(h);
                 evdi_close(h);
@@ -335,10 +410,13 @@ pub fn start(tx: FrameTx) -> Result<()> {
             }
         })
         .context("spawn evdi thread")?;
-    Ok(())
+    Ok(VirtualDisplayHandle {
+        stop,
+        join: Some(join),
+    })
 }
 
-fn run_loop(handle: *mut c_void, state_ptr: *mut State) {
+fn run_loop(handle: *mut c_void, state_ptr: *mut State, stop: Arc<AtomicBool>) {
     let mut ctx = EvdiEventContext {
         dpms: Some(on_dpms),
         mode_changed: Some(on_mode_changed),
@@ -353,7 +431,7 @@ fn run_loop(handle: *mut c_void, state_ptr: *mut State) {
     let fd = unsafe { evdi_get_event_ready(handle) };
     info!(fd, "evdi event fd");
 
-    loop {
+    while !stop.load(Ordering::Relaxed) {
         let mut pfd = libc::pollfd {
             fd,
             events: libc::POLLIN,

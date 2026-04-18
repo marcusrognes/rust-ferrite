@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use ferrite_core::PointerTool;
 use input_linux::sys::{
-    input_event, timeval, ABS_PRESSURE, ABS_X, ABS_Y, BTN_LEFT, BTN_TOOL_FINGER, BTN_TOOL_PEN,
+    input_event, timeval, ABS_PRESSURE, ABS_X, ABS_Y, BTN_TOOL_FINGER, BTN_TOOL_PEN,
     BTN_TOOL_RUBBER, BTN_TOUCH, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT,
 };
 use input_linux::{
@@ -34,8 +34,8 @@ use tracing::info;
 const ABS_MAX: i32 = 0xFFFF;
 const PRESSURE_MAX: i32 = 1023;
 
-pub const TOUCH_NAME: &str = "ferrite virtual touchscreen";
-pub const PEN_NAME: &str = "ferrite virtual pen";
+pub const TOUCH_NAME_PREFIX: &str = "ferrite virtual touchscreen";
+pub const PEN_NAME_PREFIX: &str = "ferrite virtual pen";
 
 struct Dev {
     handle: UInputHandle<File>,
@@ -47,23 +47,44 @@ struct Dev {
 pub struct InputSink {
     touch: Arc<Mutex<Dev>>,
     pen: Arc<Mutex<Dev>>,
+    mirror_pen_to_touch: bool,
 }
 
 impl InputSink {
-    pub fn new() -> Result<Self> {
-        let touch = create_touch().context("create touchscreen device")?;
-        let pen = create_pen().context("create pen device")?;
+    pub fn new(device_name: &str) -> Result<Self> {
+        let touch = create_touch(device_name).context("create touchscreen device")?;
+        let pen = create_pen(device_name).context("create pen device")?;
+        // FERRITE_PEN_MIRROR=0 disables touchscreen mirror (use when the
+        // target app speaks tablet_v2 and gets confused by parallel touch
+        // events — e.g. Krita with touch-input enabled).
+        let mirror_pen_to_touch = std::env::var("FERRITE_PEN_MIRROR")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        info!(mirror_pen_to_touch, "input sink ready");
         Ok(Self {
             touch: Arc::new(Mutex::new(touch)),
             pen: Arc::new(Mutex::new(pen)),
+            mirror_pen_to_touch,
         })
     }
 
-    pub fn send(&self, x: f32, y: f32, pressed: bool, pressure: f32, tool: PointerTool) {
+    pub fn send(
+        &self,
+        x: f32,
+        y: f32,
+        pressed: bool,
+        pressure: f32,
+        tool: PointerTool,
+        in_range: bool,
+    ) {
         match tool {
             PointerTool::Finger => self.send_finger(x, y, pressed),
             PointerTool::Pen | PointerTool::Eraser => {
-                self.send_pen(x, y, pressed, pressure, tool)
+                let was_pressed = self.pen.lock().unwrap().last_pressed;
+                self.send_pen(x, y, pressed, pressure, tool, in_range);
+                if self.mirror_pen_to_touch && (pressed || was_pressed) {
+                    self.send_finger(x, y, pressed);
+                }
             }
         }
     }
@@ -77,14 +98,21 @@ impl InputSink {
             let v = if pressed { 1 } else { 0 };
             events.push(event(EV_KEY, BTN_TOOL_FINGER, v));
             events.push(event(EV_KEY, BTN_TOUCH, v));
-            events.push(event(EV_KEY, BTN_LEFT, v));
             dev.last_pressed = pressed;
         }
         events.push(event(EV_SYN, SYN_REPORT, 0));
         let _ = dev.handle.write(&events);
     }
 
-    fn send_pen(&self, x: f32, y: f32, pressed: bool, pressure: f32, tool: PointerTool) {
+    fn send_pen(
+        &self,
+        x: f32,
+        y: f32,
+        pressed: bool,
+        pressure: f32,
+        tool: PointerTool,
+        in_range: bool,
+    ) {
         let xi = (x.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
         let yi = (y.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
         let pi = (pressure.clamp(0.0, 1.0) * PRESSURE_MAX as f32) as i32;
@@ -95,39 +123,53 @@ impl InputSink {
         };
 
         let mut dev = self.pen.lock().unwrap();
-        let mut events = vec![
-            event(EV_ABS, ABS_X, xi),
-            event(EV_ABS, ABS_Y, yi),
-            event(EV_ABS, ABS_PRESSURE, pi),
-        ];
 
-        // BTN_TOOL_<x> latches "in proximity"; BTN_TOUCH latches contact.
-        if pressed && !dev.last_pressed {
-            // Drop any previously-asserted tool that isn't the active one.
+        // Proximity-in must land in its own SYN frame before touch/motion, or
+        // libinput drops the event as out-of-spec.
+        if in_range && dev.last_tool != Some(tool_btn) {
+            let mut prox = Vec::with_capacity(3);
             if let Some(prev) = dev.last_tool {
-                if prev != tool_btn {
-                    events.push(event(EV_KEY, prev, 0));
-                }
+                prox.push(event(EV_KEY, prev, 0));
             }
-            events.push(event(EV_KEY, tool_btn, 1));
-            events.push(event(EV_KEY, BTN_TOUCH, 1));
-            events.push(event(EV_KEY, BTN_LEFT, 1));
+            prox.push(event(EV_KEY, tool_btn, 1));
+            prox.push(event(EV_SYN, SYN_REPORT, 0));
+            let _ = dev.handle.write(&prox);
             dev.last_tool = Some(tool_btn);
-        } else if !pressed && dev.last_pressed {
-            events.push(event(EV_KEY, BTN_TOUCH, 0));
-            events.push(event(EV_KEY, BTN_LEFT, 0));
+        }
+
+        if in_range {
+            let mut events = vec![
+                event(EV_ABS, ABS_X, xi),
+                event(EV_ABS, ABS_Y, yi),
+                event(EV_ABS, ABS_PRESSURE, pi),
+            ];
+            if pressed != dev.last_pressed {
+                events.push(event(EV_KEY, BTN_TOUCH, if pressed { 1 } else { 0 }));
+                dev.last_pressed = pressed;
+            }
+            events.push(event(EV_SYN, SYN_REPORT, 0));
+            let _ = dev.handle.write(&events);
+        }
+
+        // Tool out-of-proximity, in its own frame. Drop touch first if still held.
+        if !in_range {
+            let mut prox = Vec::new();
+            if dev.last_pressed {
+                prox.push(event(EV_KEY, BTN_TOUCH, 0));
+                dev.last_pressed = false;
+            }
             if let Some(t) = dev.last_tool.take() {
-                events.push(event(EV_KEY, t, 0));
+                prox.push(event(EV_KEY, t, 0));
+            }
+            if !prox.is_empty() {
+                prox.push(event(EV_SYN, SYN_REPORT, 0));
+                let _ = dev.handle.write(&prox);
             }
         }
-        dev.last_pressed = pressed;
-
-        events.push(event(EV_SYN, SYN_REPORT, 0));
-        let _ = dev.handle.write(&events);
     }
 }
 
-fn create_touch() -> Result<Dev> {
+fn create_touch(device_name: &str) -> Result<Dev> {
     let file = File::options()
         .write(true)
         .read(true)
@@ -137,7 +179,9 @@ fn create_touch() -> Result<Dev> {
     h.set_evbit(EventKind::Key)?;
     h.set_evbit(EventKind::Absolute)?;
     h.set_evbit(EventKind::Synchronize)?;
-    h.set_keybit(Key::ButtonLeft)?;
+    // No ButtonLeft — its presence makes libinput classify the device as a
+    // pointer/mouse instead of a touchscreen, which then bypasses the
+    // touch-only `map_to_output` config in cosmic-comp.
     h.set_keybit(Key::ButtonTouch)?;
     h.set_keybit(Key::ButtonToolFinger)?;
     h.set_absbit(AbsoluteAxis::X)?;
@@ -160,13 +204,14 @@ fn create_touch() -> Result<Dev> {
             resolution: 0,
         },
     };
+    let name = format!("{TOUCH_NAME_PREFIX} ({device_name})");
     h.create(
         &id,
-        TOUCH_NAME.as_bytes(),
+        name.as_bytes(),
         0,
         &[abs(AbsoluteAxis::X, ABS_MAX), abs(AbsoluteAxis::Y, ABS_MAX)],
     )?;
-    info!("touchscreen device created at /dev/uinput");
+    info!(name, "touchscreen device created at /dev/uinput");
     Ok(Dev {
         handle: h,
         last_pressed: false,
@@ -174,7 +219,7 @@ fn create_touch() -> Result<Dev> {
     })
 }
 
-fn create_pen() -> Result<Dev> {
+fn create_pen(device_name: &str) -> Result<Dev> {
     let file = File::options()
         .write(true)
         .read(true)
@@ -184,7 +229,6 @@ fn create_pen() -> Result<Dev> {
     h.set_evbit(EventKind::Key)?;
     h.set_evbit(EventKind::Absolute)?;
     h.set_evbit(EventKind::Synchronize)?;
-    h.set_keybit(Key::ButtonLeft)?;
     h.set_keybit(Key::ButtonTouch)?;
     h.set_keybit(Key::ButtonToolPen)?;
     h.set_keybit(Key::ButtonToolRubber)?;
@@ -199,7 +243,11 @@ fn create_pen() -> Result<Dev> {
         product: 0x17e1,
         version: 1,
     };
-    let abs = |axis, max| AbsoluteInfoSetup {
+    // libinput refuses to classify a device as a tablet unless ABS_X/Y carry
+    // a non-zero resolution (units-per-mm). Pick something plausible for a
+    // ~250mm-wide tablet — exact value doesn't matter for absolute mapping
+    // since the compositor scales to the assigned output anyway.
+    let abs_res = |axis, max, res| AbsoluteInfoSetup {
         axis,
         info: AbsoluteInfo {
             value: 0,
@@ -207,20 +255,21 @@ fn create_pen() -> Result<Dev> {
             maximum: max,
             fuzz: 0,
             flat: 0,
-            resolution: 0,
+            resolution: res,
         },
     };
+    let name = format!("{PEN_NAME_PREFIX} ({device_name})");
     h.create(
         &id,
-        PEN_NAME.as_bytes(),
+        name.as_bytes(),
         0,
         &[
-            abs(AbsoluteAxis::X, ABS_MAX),
-            abs(AbsoluteAxis::Y, ABS_MAX),
-            abs(AbsoluteAxis::Pressure, PRESSURE_MAX),
+            abs_res(AbsoluteAxis::X, ABS_MAX, 200),
+            abs_res(AbsoluteAxis::Y, ABS_MAX, 200),
+            abs_res(AbsoluteAxis::Pressure, PRESSURE_MAX, 1),
         ],
     )?;
-    info!("pen tablet device created at /dev/uinput");
+    info!(name, "pen tablet device created at /dev/uinput");
     Ok(Dev {
         handle: h,
         last_pressed: false,

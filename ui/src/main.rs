@@ -237,7 +237,7 @@ enum Message {
     ModeSelected(usize),
     TransportSelected(usize),
     TouchOutputSelected(usize),
-    StartStop,
+    RestartHost,
     HostExited(Option<i32>),
     HostStarted(u32),
     CopyEvdiCmd,
@@ -297,7 +297,7 @@ impl Application for App {
             child: Arc::new(Mutex::new(None)),
             running_pid: None,
             host_exe,
-            status: "Stopped".into(),
+            status: "Starting...".into(),
             qr_png,
             logs: Arc::new(StdMutex::new(VecDeque::new())),
             evdi_present: evdi_present(),
@@ -311,7 +311,10 @@ impl Application for App {
             touch_output: read_current_touch_mapping(),
             touch_apply_err: None,
         };
-        (app, Task::none())
+        // Auto-start the host immediately. The host listens with no per-mode
+        // setup until a client says Hello, so there's nothing to gate on.
+        let startup = Task::done(cosmic::Action::App(Message::RestartHost));
+        (app, startup)
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
@@ -451,17 +454,6 @@ impl Application for App {
                 None
             };
 
-        let btn_label = if self.running_pid.is_some() {
-            "Stop host"
-        } else {
-            "Start host"
-        };
-        let start_stop = widget::container(
-            widget::button::suggested(btn_label).on_press(Message::StartStop),
-        )
-        .width(Length::Fill)
-        .align_x(Alignment::End);
-
         let clients_section: Option<Element<'_, Self::Message>> =
             self.host_status.as_ref().map(|s| {
                 let header = widget::text::heading(format!(
@@ -526,7 +518,6 @@ impl Application for App {
         children.push(widget::divider::horizontal::default().into());
         children.push(touch_row.into());
         children.push(touch_caption);
-        children.push(start_stop.into());
         if let Some(c) = clients_section {
             children.push(widget::divider::horizontal::default().into());
             children.push(c);
@@ -553,7 +544,10 @@ impl Application for App {
         match message {
             Message::ModeSelected(idx) => {
                 if let Some(m) = MODE_OPTIONS.get(idx).copied() {
-                    self.mode = m;
+                    if m != self.mode {
+                        self.mode = m;
+                        return Task::done(cosmic::Action::App(Message::RestartHost));
+                    }
                 }
                 Task::none()
             }
@@ -580,55 +574,46 @@ impl Application for App {
                 }
                 Task::none()
             }
-            Message::StartStop => {
-                if self.running_pid.is_some() {
-                    let child = self.child.clone();
-                    Task::perform(
-                        async move {
-                            let mut guard = child.lock().await;
+            Message::RestartHost => {
+                let exe = self.host_exe.clone();
+                let mode = self.mode.as_env().to_string();
+                let child_arc = self.child.clone();
+                let logs = self.logs.clone();
+                {
+                    let mut g = logs.lock().unwrap();
+                    g.clear();
+                }
+                self.status = format!("Starting in {} mode...", mode);
+                Task::perform(
+                    async move {
+                        // Stop any prior child first.
+                        {
+                            let mut guard = child_arc.lock().await;
                             if let Some(mut c) = guard.take() {
                                 let _ = c.start_kill();
-                                let status = c.wait().await.ok();
-                                status.and_then(|s| s.code())
-                            } else {
-                                None
+                                let _ = c.wait().await;
                             }
-                        },
-                        |r| cosmic::Action::App(Message::HostExited(r)),
-                    )
-                } else {
-                    let exe = self.host_exe.clone();
-                    let mode = self.mode.as_env().to_string();
-                    let child_arc = self.child.clone();
-                    let logs = self.logs.clone();
-                    {
-                        let mut g = logs.lock().unwrap();
-                        g.clear();
-                    }
-                    self.status = format!("Starting in {} mode...", mode);
-                    Task::perform(
-                        async move {
-                            match spawn_host(&exe, &mode, logs).await {
-                                Ok(c) => {
-                                    let pid = c.id().unwrap_or(0);
-                                    *child_arc.lock().await = Some(c);
-                                    Ok(pid)
-                                }
-                                Err(e) => Err(e.to_string()),
+                        }
+                        match spawn_host(&exe, &mode, logs).await {
+                            Ok(c) => {
+                                let pid = c.id().unwrap_or(0);
+                                *child_arc.lock().await = Some(c);
+                                Ok(pid)
                             }
-                        },
-                        |r| {
-                            let msg = match r {
-                                Ok(pid) => Message::HostStarted(pid),
-                                Err(e) => {
-                                    warn!("start failed: {e}");
-                                    Message::HostExited(None)
-                                }
-                            };
-                            cosmic::Action::App(msg)
-                        },
-                    )
-                }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    },
+                    |r| {
+                        let msg = match r {
+                            Ok(pid) => Message::HostStarted(pid),
+                            Err(e) => {
+                                warn!("start failed: {e}");
+                                Message::HostExited(None)
+                            }
+                        };
+                        cosmic::Action::App(msg)
+                    },
+                )
             }
             Message::HostStarted(pid) => {
                 self.running_pid = Some(pid);

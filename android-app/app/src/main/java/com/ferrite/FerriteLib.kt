@@ -16,13 +16,26 @@ object FerriteLib {
     init { System.loadLibrary("ferrite_android") }
     external fun connect(): String
     /**
-     * Opens a TCP connection to host:port and blocks, calling
-     * `cb.onFrame(bytes, w, h, format)` once per incoming video frame until the
-     * connection errors. Call from a background thread — this blocks indefinitely.
+     * Opens a TCP connection to host:port, sends `Hello { deviceName, width,
+     * height }`, then blocks calling `cb.onFrame(bytes, w, h, format)` once
+     * per incoming video frame until the connection errors. Call from a
+     * background thread — this blocks indefinitely.
+     *
+     * `deviceName` shows up as the virtual monitor name (in virtual mode) and
+     * is suffixed onto the touchscreen + pen device names in libinput.
+     * `width`/`height` are the desired virtual-monitor pixels (ignored in
+     * mirror mode).
      *
      * Throws RuntimeException on I/O or protocol error.
      */
-    external fun stream(host: String, port: Int, cb: FrameCallback)
+    external fun stream(
+        host: String,
+        port: Int,
+        deviceName: String,
+        width: Int,
+        height: Int,
+        cb: FrameCallback,
+    )
 
     /**
      * Push a pointer event to the host over the currently-active `stream()`
@@ -34,6 +47,7 @@ object FerriteLib {
         pressed: Boolean,
         pressure: Float,
         tool: Int,
+        inRange: Boolean,
     )
 
     /** Aborts the current `stream()` blocking call by closing the socket. */

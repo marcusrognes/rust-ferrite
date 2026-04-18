@@ -15,3 +15,7 @@ ashpd = { version = "0.13", default-features = false, features = ["tokio", "scre
 pipewire = "0.9"
 libc = "0.2"
 input-linux = "0.7"
+ron = "0.8"
+serde = { version = "1", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+socket2 = "0.5"
