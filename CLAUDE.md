@@ -8,6 +8,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   wait for explicit commit requests — for this repo, commit automatically once
   a change builds/tests/runs successfully. Commit message should describe the
   why; one logical change per commit. Don't commit half-finished work.
+- **Keep `README.md` in sync with user-visible behavior.** When a change
+  adds/removes a feature, changes a run command, introduces a new env var,
+  changes prerequisites, or alters how transports/modes work, update
+  `README.md` in the same commit. Internal refactors and bug fixes with no
+  user-visible surface don't need README edits. `STATUS.md` is the running
+  ledger (what works / what doesn't); `README.md` is the public-facing
+  overview — both can move together when behavior changes.
 
 ## Purpose
 
