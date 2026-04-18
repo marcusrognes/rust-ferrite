@@ -33,7 +33,6 @@ const READ_CHUNK: usize = 64 * 1024;
 /// comfortably above any small-packet coalescing thresholds on the Android
 /// side, while still ending on a non-max-packet boundary so a short-packet
 /// terminates the transfer.
-const SYNC_MAGIC: &[u8] = b"FERRITE\0";
 const SYNC_PREAMBLE: &[u8] = &{
     let mut a = [0xA5u8; 511]; // 511 bytes: short-packet-friendly (< 512)
     a[0] = b'F';

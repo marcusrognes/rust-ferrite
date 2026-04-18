@@ -122,7 +122,7 @@ fn do_stream_tcp(
     height: u32,
     callback: &JObject,
 ) -> anyhow::Result<()> {
-    let mut sock = TcpStream::connect((host, port))?;
+    let sock = TcpStream::connect((host, port))?;
     // No read timeout: host may go idle between frames when nothing changes
     // on screen. But enable TCP keepalive so the kernel detects a dead
     // connection (e.g. USB cable yanked) within ~10s instead of the default
@@ -352,7 +352,7 @@ fn read_loop<R: Read>(
 
 #[no_mangle]
 pub extern "system" fn Java_com_ferrite_FerriteLib_sendTouches<'l>(
-    mut env: JNIEnv<'l>,
+    env: JNIEnv<'l>,
     _class: JClass<'l>,
     ids: JIntArray<'l>,
     xs: JFloatArray<'l>,

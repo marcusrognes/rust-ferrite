@@ -277,7 +277,7 @@ fn open_accessory_if_present() -> Result<Option<AoaStream>> {
         if desc.vendor_id() != AOA_VID || !AOA_PIDS.contains(&desc.product_id()) {
             continue;
         }
-        let mut handle = dev.open().context("open accessory device")?;
+        let handle = dev.open().context("open accessory device")?;
         let cfg = dev.active_config_descriptor().context("active config")?;
         // First interface with two bulk endpoints is the accessory interface.
         for iface in cfg.interfaces() {

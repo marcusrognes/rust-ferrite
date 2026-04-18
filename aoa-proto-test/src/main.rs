@@ -33,8 +33,7 @@ const REQ_START: u8 = 53;
 
 const USB_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Matches host::SYNC_MAGIC + padding.
-const SYNC_MAGIC: &[u8] = b"FERRITE\0";
+/// Matches host::SYNC_PREAMBLE.
 const SYNC_PREAMBLE: &[u8] = &{
     let mut a = [0xA5u8; 511];
     a[0] = b'F';
@@ -99,7 +98,7 @@ fn ensure_accessory(first: bool) -> Result<()> {
 
 fn run_once(allow_prompt_wait: bool) -> Result<()> {
     let dev = find_accessory().ok_or_else(|| anyhow!("no accessory"))?;
-    let mut handle = dev.open().context("open accessory")?;
+    let handle = dev.open().context("open accessory")?;
     handle.set_auto_detach_kernel_driver(true).ok();
 
     let (iface, ep_in, ep_out) = find_bulk_interface(&dev)?;
@@ -221,10 +220,6 @@ fn run_once(allow_prompt_wait: bool) -> Result<()> {
     thread::sleep(Duration::from_millis(500));
     println!("[9] iteration OK");
     Ok(())
-}
-
-fn read_frame(handle: &DeviceHandle<GlobalContext>, ep_in: u8) -> Result<Vec<u8>> {
-    read_frame_with_timeout(handle, ep_in, Duration::from_secs(5))
 }
 
 fn read_frame_with_timeout(

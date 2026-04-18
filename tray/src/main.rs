@@ -253,15 +253,11 @@ fn main() {
         mode,
         enabled,
     };
-    let handle = tray.spawn().expect("spawn tray service");
-
-    // Block forever — ksni runs on its own thread, we need to keep main alive.
-    // Quit menu calls std::process::exit so we never actually return here.
+    // Keep the ksni handle alive for the lifetime of main — it owns the
+    // D-Bus registration. The Quit menu calls std::process::exit, so the
+    // park loop never returns.
+    let _handle = tray.spawn().expect("spawn tray service");
     loop {
         std::thread::park();
-    }
-    #[allow(unreachable_code)]
-    {
-        drop(handle);
     }
 }

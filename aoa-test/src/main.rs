@@ -71,7 +71,7 @@ fn main() -> Result<()> {
 fn run_once(allow_prompt_wait: bool, payload_size: usize) -> Result<()> {
     use std::sync::Arc;
     let dev = find_accessory().ok_or_else(|| anyhow!("no accessory"))?;
-    let mut handle = dev.open().context("open accessory")?;
+    let handle = dev.open().context("open accessory")?;
     handle.set_auto_detach_kernel_driver(true).ok();
 
     let (iface, ep_in, ep_out) = find_bulk_interface(&dev)?;
@@ -148,9 +148,8 @@ fn run_once(allow_prompt_wait: bool, payload_size: usize) -> Result<()> {
         Duration::from_secs(1)
     };
     let prompt_attempts = if allow_prompt_wait { 10 } else { 3 };
-    let mut sent = 0;
     // First write may need retries until Android accepts the accessory prompt.
-    {
+    let mut sent = {
         let mut attempt = 0;
         let n = loop {
             attempt += 1;
@@ -163,9 +162,9 @@ fn run_once(allow_prompt_wait: bool, payload_size: usize) -> Result<()> {
                 Err(e) => bail!("write_bulk: {e}"),
             }
         };
-        sent = n;
-        println!("[4] first write {n} bytes (total {sent}/{reply_size})");
-    }
+        println!("[4] first write {n} bytes (total {n}/{reply_size})");
+        n
+    };
     while sent < pattern_arc.len() {
         let n = wh
             .write_bulk(ep_out, &pattern_arc[sent..], Duration::from_secs(10))
