@@ -109,9 +109,9 @@ async fn main() -> Result<()> {
 
     // AOA listener: blocks on a plugged-in Android device entering accessory
     // mode, bridges its bulk endpoints into a tokio AsyncRead+AsyncWrite pair,
-    // hands that pair to the same `handle()` the TCP listener uses. Set
-    // FERRITE_AOA=0 to disable.
-    if std::env::var("FERRITE_AOA").ok().as_deref() != Some("0") {
+    // hands that pair to the same `handle()` the TCP listener uses. Opt-in
+    // via FERRITE_AOA=1 — see STATUS.md for the reliability caveat.
+    if std::env::var("FERRITE_AOA").ok().as_deref() == Some("1") {
         let shared_rx = shared_rx.clone();
         let clients = clients.clone();
         tokio::spawn(async move {

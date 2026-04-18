@@ -4,8 +4,9 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 
 ## Works
 
-- **Wi-Fi transport** (`main`) — TCP over LAN, QR-code pairing from the tablet.
-- **USB transport via `adb reverse`** — plug device, run `adb reverse tcp:7543 tcp:7543`, app auto-detects `127.0.0.1:7543`.
+- **Pluggable transports** — host side is generic over `AsyncRead + AsyncWrite`; client side has a `Transport` sealed class (`Tcp` + `Aoa`). Adding a new transport is one more `run_protocol` call site.
+- **Wi-Fi transport** (`main`) — TCP over LAN, QR-code pairing from the tablet. Opt-in via "Connect Wi-Fi" button on the tablet so the app doesn't auto-connect over the network.
+- **USB transport via `adb reverse`** — plug device, run `adb reverse tcp:7543 tcp:7543`, app auto-detects `127.0.0.1:7543`. First-class, always-available path.
 - **Mirror mode** — captures an existing display via xdg-desktop-portal + PipeWire.
 - **Virtual monitor mode** (`FERRITE_MODE=virtual`) — evdi-backed second monitor, sized to the client's screen via `Hello`. Shows in cosmic as `DVI-I-N external display`. Torn down on disconnect.
 - **Multi-touch** — MT-B protocol to uinput, per-finger slot tracking.
@@ -17,16 +18,20 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 - **Low-latency H.264 streaming** — VAAPI hardware encoder, CQP rate mode, AUD framing, SPS/PPS at every keyframe. One access-unit per wire frame so the Android decoder gets clean MediaCodec inputs.
 - **Idle skip** — xxh3 hash of captured RGB; identical frames aren't re-encoded.
 
+## Partially works / experimental
+
+- **AOA (Android Open Accessory) transport** — code is on `main` but default-off; enable with `FERRITE_AOA=1`. The standalone echo test (`aoa-test` crate + `AoaEchoActivity`) proves the raw transport is clean (256 B, 1 MB, concurrent-write, session-reuse all pass). The full protocol inside MainActivity is inconsistent: first N sessions after a tablet reboot stream fine, subsequent reconnects hit an Android-side `UsbManager.openAccessory` state that returns `null` or throws "no accessory attached". Root cause appears to be Android's USB service getting wedged across rapid accessory re-attaches; can't be fixed from userspace. Worth revisiting if we find a way to reliably reset that state (`pm clear` + physical unplug mostly helps) or if we decide to ship a different USB protocol.
+- **`aoa-experiment` branch** (historical) — earlier AOA integration attempt, kept for reference. All useful parts are on `main` now.
+
 ## Doesn't work
 
-- **AOA (Android Open Accessory) transport** — lives on the `aoa-experiment` branch. Handshake + video direction (host → tablet) work, but the input direction (tablet → host) desyncs on the first Hello after each reconnect. Root cause seems to be stale bytes in the USB bulk IN endpoint surviving across sessions; sync-magic preamble and host-side drain mitigate but don't fully fix. Activate with `FERRITE_AOA=1` once fixed.
 - **Intra-refresh H.264** — only libx264 supports it; would mean giving up VAAPI hardware encoding. Skipped.
 
 ## Dependencies
 
 System deps (install once): `libpipewire-0.3-dev`, `libspa-0.2-dev`, `libclang-dev`, `clang`, `libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `mesa-va-drivers`, `evdi-dkms`, `libevdi-dev`, JDK 17+.
 
-When packaging for distribution: the AOA transport (on the experiment branch) requires a udev rule installed to `/etc/udev/rules.d/51-ferrite-aoa.rules` — can't be done from a user-mode binary, must come from the package's post-install script.
+When packaging for distribution: AOA transport requires a udev rule installed to `/etc/udev/rules.d/51-ferrite-aoa.rules` — can't be done from a user-mode binary, must come from the package's post-install script.
 
 ## Run
 
