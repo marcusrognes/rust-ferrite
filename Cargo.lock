@@ -1717,9 +1717,11 @@ dependencies = [
 name = "ferrite-tray"
 version = "0.1.0"
 dependencies = [
+ "ferrite-core",
  "ksni",
  "ron 0.8.1",
  "serde",
+ "serde_json",
  "tracing",
  "tracing-subscriber",
 ]

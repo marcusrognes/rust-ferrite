@@ -1,17 +1,20 @@
 //! Ferrite tray: the one always-running process.
 //!
-//! - Owns the `ferrite-host` child (restarts it on mode change, kills it on quit).
-//! - Publishes a `StatusNotifierItem` tray icon with menu for Open Panel /
-//!   Mode / Quit.
+//! - Owns the `ferrite-host` child: starts it, restarts it on unexpected
+//!   exit, stops it on mode change / disable / quit.
+//! - Publishes a `StatusNotifierItem` tray icon with menu + tooltip.
 //! - Spawns `ferrite-ui` on demand — each invocation is a throwaway window.
 //!
-//! Expected to be autostarted at login (desktop entry / systemd user service).
+//! Expected to be autostarted at login (see `packaging/`).
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::thread;
+use std::time::Duration;
 
-use ksni::blocking::TrayMethods;
+use ferrite_core::{Status, status_path};
+use ksni::blocking::{Handle, TrayMethods};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,7 +68,8 @@ fn save_config(cfg: &Config) {
 }
 
 /// Locate sibling binaries in the same directory as this executable; that's
-/// how cargo lays things out, and how we'd ship a release bundle.
+/// how cargo lays things out, and how the `packaging/install.sh` script
+/// deploys a release bundle.
 fn sibling_exe(name: &str) -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -74,48 +78,133 @@ fn sibling_exe(name: &str) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(name))
 }
 
-struct Host {
-    child: Option<Child>,
+// -----------------------------------------------------------------------------
+// Host manager: owns the ferrite-host child. Runs on a dedicated thread,
+// driven by a command channel. Responsibilities:
+//
+//   1. Start / stop the child on explicit commands from the tray menu.
+//   2. Restart the child on unexpected exit (backoff 1s, capped 30s).
+//   3. Poll $XDG_RUNTIME_DIR/ferrite-status.json and push the connected
+//      client count back into the tray via the ksni handle.
+
+enum Cmd {
+    Start(Mode),
+    Stop,
+    Quit,
 }
 
-impl Host {
-    fn new() -> Self {
-        Self { child: None }
+fn spawn_host(mode: Mode) -> std::io::Result<Child> {
+    let exe = sibling_exe("ferrite-host");
+    tracing::info!(mode = ?mode, exe = %exe.display(), "starting host");
+    let mut cmd = Command::new(&exe);
+    cmd.env("FERRITE_MODE", mode.env());
+    // Default RUST_LOG=info so spawned host logs land in the tray's journal
+    // entry (or wherever stderr goes) — users can override by setting
+    // RUST_LOG before launching the tray.
+    if std::env::var_os("RUST_LOG").is_none() {
+        cmd.env("RUST_LOG", "info");
     }
+    cmd.stdout(Stdio::null()).stderr(Stdio::inherit());
+    cmd.spawn()
+}
 
-    fn start(&mut self, mode: Mode) {
-        self.stop();
-        let exe = sibling_exe("ferrite-host");
-        tracing::info!(mode = ?mode, exe = %exe.display(), "starting host");
-        match Command::new(&exe)
-            .env("FERRITE_MODE", mode.env())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-        {
-            Ok(c) => self.child = Some(c),
-            Err(e) => tracing::warn!(error = %e, "host spawn failed"),
+fn manager_loop(rx: mpsc::Receiver<Cmd>, handle: Handle<Ferrite>) {
+    let mut active_mode: Option<Mode> = None;
+    let mut child: Option<Child> = None;
+    let mut backoff = Duration::from_secs(1);
+
+    loop {
+        let tick = Duration::from_millis(500);
+        match rx.recv_timeout(tick) {
+            Ok(Cmd::Start(mode)) => {
+                kill(&mut child);
+                active_mode = Some(mode);
+                backoff = Duration::from_secs(1);
+                match spawn_host(mode) {
+                    Ok(c) => child = Some(c),
+                    Err(e) => tracing::warn!(error = %e, "host spawn failed"),
+                }
+            }
+            Ok(Cmd::Stop) => {
+                active_mode = None;
+                kill(&mut child);
+            }
+            Ok(Cmd::Quit) => {
+                kill(&mut child);
+                return;
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                // Poll child status + refresh tooltip.
+                if let Some(c) = child.as_mut() {
+                    match c.try_wait() {
+                        Ok(Some(status)) => {
+                            tracing::warn!(
+                                ?status,
+                                backoff_s = backoff.as_secs(),
+                                "host exited, restarting after backoff"
+                            );
+                            child = None;
+                            thread::sleep(backoff);
+                            backoff = (backoff * 2).min(Duration::from_secs(30));
+                            if let Some(mode) = active_mode {
+                                match spawn_host(mode) {
+                                    Ok(c) => child = Some(c),
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "host respawn failed")
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            // Still running; reset backoff once we've survived
+                            // a tick without exit.
+                            backoff = Duration::from_secs(1);
+                        }
+                        Err(e) => tracing::warn!(error = %e, "try_wait failed"),
+                    }
+                }
+                refresh_tooltip(&handle, child.is_some());
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
         }
     }
+}
 
-    fn stop(&mut self) {
-        if let Some(mut c) = self.child.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
+fn kill(child: &mut Option<Child>) {
+    if let Some(mut c) = child.take() {
+        let _ = c.kill();
+        let _ = c.wait();
     }
 }
 
-impl Drop for Host {
-    fn drop(&mut self) {
-        self.stop();
-    }
+fn read_status() -> Option<Status> {
+    let p = status_path();
+    let s = std::fs::read_to_string(p).ok()?;
+    serde_json::from_str(&s).ok()
 }
+
+fn refresh_tooltip(handle: &Handle<Ferrite>, running: bool) {
+    let clients = if running {
+        read_status().map(|s| s.clients.len()).unwrap_or(0)
+    } else {
+        0
+    };
+    handle.update(move |t| {
+        t.running = running;
+        t.clients = clients;
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Tray UI. `tx` is the command channel into the host manager; `running` and
+// `clients` are refreshed from the manager every ~500ms via handle.update.
 
 struct Ferrite {
-    host: Arc<Mutex<Host>>,
+    tx: Sender<Cmd>,
     mode: Mode,
     enabled: bool,
+    running: bool,
+    clients: usize,
 }
 
 impl ksni::Tray for Ferrite {
@@ -126,11 +215,31 @@ impl ksni::Tray for Ferrite {
         "Ferrite".into()
     }
     fn icon_name(&self) -> String {
-        // Grey out the tray glyph when the host isn't running.
-        if self.enabled {
+        // Active glyph when a host process is alive; greyed-out when disabled
+        // or while the host has crashed and we haven't restarted it yet.
+        if self.enabled && self.running {
             "video-display".into()
         } else {
             "video-display-symbolic".into()
+        }
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        let state = if !self.enabled {
+            "disabled".to_string()
+        } else if !self.running {
+            "host not running".to_string()
+        } else {
+            match self.clients {
+                0 => "no clients connected".to_string(),
+                1 => "1 client connected".to_string(),
+                n => format!("{n} clients connected"),
+            }
+        };
+        ksni::ToolTip {
+            title: format!("Ferrite — {}", self.mode_label()),
+            description: state,
+            ..Default::default()
         }
     }
 
@@ -182,7 +291,9 @@ impl ksni::Tray for Ferrite {
             StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(|this: &mut Self| {
-                    this.host.lock().unwrap().stop();
+                    let _ = this.tx.send(Cmd::Quit);
+                    // Give the manager a beat to SIGTERM the child before we exit.
+                    thread::sleep(Duration::from_millis(200));
                     std::process::exit(0);
                 }),
                 ..Default::default()
@@ -193,6 +304,13 @@ impl ksni::Tray for Ferrite {
 }
 
 impl Ferrite {
+    fn mode_label(&self) -> &'static str {
+        match self.mode {
+            Mode::Mirror => "mirror",
+            Mode::Virtual => "virtual monitor",
+        }
+    }
+
     fn set_mode(&mut self, mode: Mode) {
         if mode == self.mode {
             return;
@@ -203,7 +321,7 @@ impl Ferrite {
             enabled: Some(self.enabled),
         });
         if self.enabled {
-            self.host.lock().unwrap().start(mode);
+            let _ = self.tx.send(Cmd::Start(mode));
         }
     }
 
@@ -217,9 +335,9 @@ impl Ferrite {
             enabled: Some(enabled),
         });
         if enabled {
-            self.host.lock().unwrap().start(self.mode);
+            let _ = self.tx.send(Cmd::Start(self.mode));
         } else {
-            self.host.lock().unwrap().stop();
+            let _ = self.tx.send(Cmd::Stop);
         }
     }
 }
@@ -243,21 +361,29 @@ fn main() {
     let mode = cfg.mode.unwrap_or(Mode::Virtual);
     let enabled = cfg.enabled.unwrap_or(true);
 
-    let host = Arc::new(Mutex::new(Host::new()));
-    if enabled {
-        host.lock().unwrap().start(mode);
-    }
+    let (tx, rx) = mpsc::channel::<Cmd>();
 
     let tray = Ferrite {
-        host: host.clone(),
+        tx: tx.clone(),
         mode,
         enabled,
+        running: false,
+        clients: 0,
     };
+    let handle = tray.spawn().expect("spawn tray service");
+
+    // Kick off the host manager. It'll pick up the initial Start below.
+    let mgr_handle = handle.clone();
+    thread::spawn(move || manager_loop(rx, mgr_handle));
+
+    if enabled {
+        let _ = tx.send(Cmd::Start(mode));
+    }
+
     // Keep the ksni handle alive for the lifetime of main — it owns the
-    // D-Bus registration. The Quit menu calls std::process::exit, so the
-    // park loop never returns.
-    let _handle = tray.spawn().expect("spawn tray service");
+    // D-Bus registration. The Quit menu calls std::process::exit.
+    let _handle = handle;
     loop {
-        std::thread::park();
+        thread::park();
     }
 }
