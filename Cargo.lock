@@ -1686,6 +1686,7 @@ dependencies = [
  "bincode",
  "ferrite-core",
  "jni 0.21.1",
+ "libc",
  "socket2 0.5.10",
  "tokio",
 ]

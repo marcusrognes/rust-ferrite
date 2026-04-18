@@ -8,6 +8,7 @@ use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::fd::{FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -48,6 +49,12 @@ fn tx_writer() -> &'static Mutex<Option<Box<dyn Write + Send>>> {
     static S: OnceLock<Mutex<Option<Box<dyn Write + Send>>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
 }
+
+/// Raw fd of the active AOA accessory, tracked so `disconnect()` can
+/// `shutdown(2)` it from another thread — that unblocks the protocol
+/// reader's `read_exact`, which a simple `File::drop` on the writer half
+/// can't. -1 when no AOA session is active.
+static AOA_FD: AtomicI32 = AtomicI32::new(-1);
 
 // -----------------------------------------------------------------------------
 // Legacy health check kept around for the Kotlin side's `connect()` call.
@@ -173,6 +180,14 @@ fn do_stream_fd(
     let writer_fd = owned.try_clone()?;
     let mut reader = std::fs::File::from(owned);
     let writer = std::fs::File::from(writer_fd);
+    AOA_FD.store(fd, Ordering::Relaxed);
+    struct ClearFd;
+    impl Drop for ClearFd {
+        fn drop(&mut self) {
+            AOA_FD.store(-1, Ordering::Relaxed);
+        }
+    }
+    let _fd_guard = ClearFd;
     run_protocol(env, &mut reader, Box::new(writer), device_name, width, height, callback)
 }
 
@@ -386,15 +401,24 @@ fn send_upstream(msg: &ClientMessage) {
     }
 }
 
-/// Drop the writer, which closes the socket/fd and unblocks the blocking
-/// stream call with an I/O error. Lets the caller abandon a transport that's
-/// wedged (e.g. USB yanked) without waiting for the far-end keepalive to fire.
+/// Drop the writer and shut down any active AOA fd. Either unblocks the
+/// blocking protocol reader so the stream call returns with an I/O error,
+/// letting the caller start a fresh session. Dropping the writer alone
+/// isn't enough for AOA: reader and writer are dup'd fds pointing at the
+/// same socketpair end, so the reader's `read_exact` stays blocked until we
+/// `shutdown(2)` the socket.
 #[no_mangle]
 pub extern "system" fn Java_com_ferrite_FerriteLib_disconnect(
     _env: JNIEnv,
     _class: JClass,
 ) {
     tx_writer().lock().unwrap().take();
+    let fd = AOA_FD.swap(-1, Ordering::Relaxed);
+    if fd >= 0 {
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
