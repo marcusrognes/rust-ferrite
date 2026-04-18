@@ -12,15 +12,18 @@ print_next_steps() {
 
 ==> next steps:
 
-  # mirror an existing display (default):
-  ./target/release/ferrite-host
+  # Start the tray (owns host lifecycle; stays running in system tray):
+  ./target/release/ferrite-tray
 
-  # virtual monitor mode (needs evdi loaded):
+  # From the tray menu: "Open Panel" opens ferrite-ui on demand.
+  # Mode is toggled via the tray menu and persists to ~/.config/ferrite/tray.ron.
+
+  # Run host directly (no tray / no autostart), if you just want the daemon:
+  ./target/release/ferrite-host                       # mirror mode
+  FERRITE_MODE=virtual ./target/release/ferrite-host  # virtual monitor
+
+  # Evdi setup (once per boot, required for virtual mode):
   sudo modprobe evdi && echo 1 | sudo tee /sys/devices/evdi/add
-  FERRITE_MODE=virtual ./target/release/ferrite-host
-
-  # control panel UI (spawns host as child):
-  ./target/release/ferrite-ui
 
   # USB transport (instead of Wi-Fi):
   adb reverse tcp:7543 tcp:7543
@@ -37,14 +40,13 @@ for arg in "$@"; do
     esac
 done
 
-echo "==> killing running ferrite-host (if any)"
+echo "==> killing running ferrite-{tray,host,ui} (if any)"
+pkill -x ferrite-tray 2>/dev/null || true
 pkill -x ferrite-host 2>/dev/null || true
+pkill -x ferrite-ui 2>/dev/null || true
 
-echo "==> cargo build -p ferrite-host --release"
-cargo build -p ferrite-host --release
-
-echo "==> cargo build -p ferrite-ui --release"
-cargo build -p ferrite-ui --release
+echo "==> cargo build --release (host + ui + tray)"
+cargo build --release -p ferrite-host -p ferrite-ui -p ferrite-tray
 
 echo "==> ./build-android.sh"
 ./build-android.sh

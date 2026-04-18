@@ -8,11 +8,13 @@ Duet-like system: use an Android device as an external display / pen tablet for 
 
 ## Workspace layout
 
-Cargo workspace (`resolver = "2"`) with three crates plus an Android app:
+Cargo workspace (`resolver = "2"`) with five crates plus an Android app:
 
-- **`core/`** (`ferrite-core`, lib) — shared wire protocol. `HostMessage` (video frames + ping), `ClientMessage` (touch events + pong), `PixelFormat { Rgba8, Jpeg, H264 }`. Serialized via `bincode` + `serde`. Both host and Android link this crate; keep enum variants in sync on both sides — `bincode` isn't self-describing, so any variant reorder or field change is breaking.
+- **`core/`** (`ferrite-core`, lib) — shared wire protocol. `HostMessage` (video frames + ping), `ClientMessage` (Hello + Pointer + Touches + Pong), `PixelFormat { Rgba8, Jpeg, H264 }`, `TouchPoint`. Serialized via `bincode` + `serde`. Both host and Android link this crate; keep enum variants in sync on both sides — `bincode` isn't self-describing, so any variant reorder or field change is breaking.
 - **`host/`** (`ferrite-host`, bin) — Linux-side daemon. `tokio` runtime, `tracing` logging. Contains the capture + encode + stream pipeline (see "Host architecture" below).
-- **`android-jni/`** (`ferrite-android`, `cdylib`) — native library loaded by the Android app over JNI (`jni` 0.21). Exports `Java_com_ferrite_FerriteLib_{connect,stream}`. Produces `.so` files only.
+- **`tray/`** (`ferrite-tray`, bin) — the always-running process. Owns the `ferrite-host` child, publishes a StatusNotifierItem tray icon via `ksni`, spawns `ferrite-ui` on demand. Mode (mirror/virtual) is toggled from the tray menu and persisted to `$XDG_CONFIG_HOME/ferrite/tray.ron`. Expected to autostart at login.
+- **`ui/`** (`ferrite-ui`, bin) — libcosmic throwaway control panel. Reads `ferrite-host`'s status JSON, shows QR + connection info + clients + touch-mapping + transport toggle. Does NOT own the host process (tray does). Close = exit panel, host keeps running.
+- **`android-jni/`** (`ferrite-android`, `cdylib`) — native library loaded by the Android app over JNI (`jni` 0.21). Exports `Java_com_ferrite_FerriteLib_{connect,stream,sendPointer,sendTouches,disconnect}`. Produces `.so` files only.
 - **`android-app/`** — Android Gradle project (AGP 8.7.0, Kotlin 1.9.25, Gradle 8.9 via wrapper). Package `com.ferrite`. `MainActivity` uses a `SurfaceView` + `MediaCodec("video/avc")` decoder; `FerriteLib.stream(host, port, cb)` blocks a worker thread, firing `cb.onFrame(bytes, w, h, formatId)` per incoming H.264 chunk which is queued into MediaCodec input buffers. Built APK bundles `libferrite_android.so` for both `arm64-v8a` (device) and `x86_64` (emulator) under `app/src/main/jniLibs/<abi>/`. `local.properties` (gitignored) points at `~/Android/Sdk`.
 
 ## Build / dev commands
@@ -32,7 +34,10 @@ cargo run -p ferrite-host --release
 # Run host binary in virtual-monitor mode (requires evdi device — see below)
 FERRITE_MODE=virtual cargo run -p ferrite-host --release
 
-# Run the control panel UI (libcosmic). Spawns ferrite-host as a child.
+# Run the tray (owns host + spawns UI on demand — normal entry point)
+cargo run -p ferrite-tray --release
+
+# Run only the control panel UI (read-only view; does not start host)
 cargo run -p ferrite-ui --release
 
 # Build + package Android APK (Rust .so for arm64+x86_64, then gradle assembleDebug)

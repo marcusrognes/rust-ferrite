@@ -1,14 +1,12 @@
-//! Ferrite host control panel.
+//! Ferrite control panel (throwaway window).
 //!
-//! A small libcosmic window that shows connection info (IP + port + QR code),
-//! lets you pick a capture mode (mirror vs virtual monitor), and
-//! starts/stops the `ferrite-host` binary as a child process.
+//! Shows connection info + QR, toggles transport (Wi-Fi / adb-reverse USB),
+//! and configures cosmic-comp touchscreen output mapping. Does NOT own the
+//! `ferrite-host` process — that's managed by `ferrite-tray`. Closing this
+//! window only exits the panel; host keeps running.
 
-use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use cosmic::app::{Core, Settings, Task};
@@ -16,15 +14,9 @@ use cosmic::iced::{Alignment, Length, Subscription};
 use cosmic::{Application, Element, executor, widget};
 use ferrite_core::{Status, status_path};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 const TOUCH_DEVICE_NAME: &str = "ferrite virtual touchscreen";
-
-const LOG_LINES_MAX: usize = 200;
-type LogBuf = Arc<StdMutex<VecDeque<String>>>;
 
 const EVDI_SETUP_CMD: &str = "echo 1 | sudo tee /sys/devices/evdi/add";
 
@@ -204,27 +196,6 @@ fn adb_reverse(serial: Option<&str>, port: u16) -> Result<(), String> {
 const PORT: u16 = 7543;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Mode {
-    Mirror,
-    Virtual,
-}
-
-impl Mode {
-    fn as_env(self) -> &'static str {
-        match self {
-            Mode::Mirror => "mirror",
-            Mode::Virtual => "virtual",
-        }
-    }
-}
-
-const MODE_OPTIONS: [Mode; 2] = [Mode::Mirror, Mode::Virtual];
-static MODE_LABELS: [&str; 2] = [
-    "Mirror existing display",
-    "Virtual second monitor (evdi)",
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Transport {
     Wifi,
     Usb,
@@ -234,12 +205,8 @@ static TRANSPORT_LABELS: [&str; 2] = ["Wi-Fi (LAN)", "USB (adb reverse)"];
 
 #[derive(Clone, Debug)]
 enum Message {
-    ModeSelected(usize),
     TransportSelected(usize),
     TouchOutputSelected(usize),
-    RestartHost,
-    HostExited(Option<i32>),
-    HostStarted(u32),
     CopyEvdiCmd,
     ForgetPortalGrant,
     Tick,
@@ -247,14 +214,8 @@ enum Message {
 
 struct App {
     core: Core,
-    mode: Mode,
     local_ip: Option<IpAddr>,
-    child: Arc<Mutex<Option<Child>>>,
-    running_pid: Option<u32>,
-    host_exe: PathBuf,
-    status: String,
     qr_png: Option<Vec<u8>>,
-    logs: LogBuf,
     evdi_present: bool,
     portal_token_present: bool,
     host_status: Option<Status>,
@@ -282,24 +243,11 @@ impl Application for App {
 
     fn init(core: Core, _flags: ()) -> (Self, Task<Self::Message>) {
         let local_ip = local_ip_address::local_ip().ok();
-        let host_exe = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .map(|d| d.join("ferrite-host"))
-            .unwrap_or_else(|| PathBuf::from("ferrite-host"));
-
         let qr_png = qr_png_for_url(&connect_url(local_ip, PORT, Transport::Wifi));
-
         let app = App {
             core,
-            mode: Mode::Virtual,
             local_ip,
-            child: Arc::new(Mutex::new(None)),
-            running_pid: None,
-            host_exe,
-            status: "Starting...".into(),
             qr_png,
-            logs: Arc::new(StdMutex::new(VecDeque::new())),
             evdi_present: evdi_present(),
             portal_token_present: portal_token_present(),
             host_status: None,
@@ -311,24 +259,25 @@ impl Application for App {
             touch_output: read_current_touch_mapping(),
             touch_apply_err: None,
         };
-        // Auto-start the host immediately. The host listens with no per-mode
-        // setup until a client says Hello, so there's nothing to gate on.
-        let startup = Task::done(cosmic::Action::App(Message::RestartHost));
-        (app, startup)
+        (app, Task::none())
     }
 
     fn subscription(&self) -> Subscription<Self::Message> {
         cosmic::iced::time::every(Duration::from_millis(250)).map(|_| Message::Tick)
     }
 
+
     fn view(&self) -> Element<'_, Self::Message> {
         let spacing = cosmic::theme::spacing();
-        let selected_idx = MODE_OPTIONS.iter().position(|m| *m == self.mode);
 
         let header = widget::text::title2("Ferrite");
+        let status_text = match self.host_status.as_ref() {
+            Some(s) => format!("{} — {} client(s)", s.mode, s.clients.len()),
+            None => "host not running".into(),
+        };
         let status_line = widget::row::with_children(vec![
             widget::text::body("Status:").into(),
-            widget::text::body(&self.status).into(),
+            widget::text::body(status_text).into(),
         ])
         .spacing(spacing.space_xs);
 
@@ -354,15 +303,6 @@ impl Application for App {
             .into(),
             None => widget::text::caption("(no QR — add a local IP)").into(),
         };
-
-        let mode_row = widget::row::with_children(vec![
-            widget::text::body("Mode:").into(),
-            widget::dropdown(&MODE_LABELS, selected_idx, Message::ModeSelected)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(spacing.space_xs)
-        .align_y(Alignment::Center);
 
         let transport_idx = TRANSPORT_OPTIONS.iter().position(|t| *t == self.transport);
         let transport_row = widget::row::with_children(vec![
@@ -407,7 +347,7 @@ impl Application for App {
             };
 
         let portal_row: Option<Element<'_, Self::Message>> =
-            if self.mode == Mode::Mirror && self.portal_token_present {
+            if self.portal_token_present {
                 Some(
                     widget::row::with_children(vec![
                         widget::text::caption("Portal grant cached — won't ask again").into(),
@@ -425,7 +365,7 @@ impl Application for App {
             };
 
         let evdi_banner: Option<Element<'_, Self::Message>> =
-            if self.mode == Mode::Virtual && !self.evdi_present {
+            if !self.evdi_present {
                 let text_col = widget::column::with_children(vec![
                     widget::text::heading("Virtual monitor needs setup").into(),
                     widget::text::body(
@@ -481,21 +421,6 @@ impl Application for App {
                 }
             });
 
-        let log_text = {
-            let g = self.logs.lock().unwrap();
-            if g.is_empty() {
-                String::from("(no logs yet)")
-            } else {
-                g.iter().cloned().collect::<Vec<_>>().join("\n")
-            }
-        };
-        let log_pane = widget::container(
-            widget::scrollable(widget::text::monotext(log_text).size(11))
-                .width(Length::Fill)
-                .height(Length::Fixed(200.0)),
-        )
-        .padding(spacing.space_xs);
-
         let mut children: Vec<Element<'_, Self::Message>> = vec![
             header.into(),
             status_line.into(),
@@ -507,9 +432,8 @@ impl Application for App {
         if let Some(s) = usb_status {
             children.push(s);
         }
-        children.push(widget::divider::horizontal::default().into());
-        children.push(mode_row.into());
         if let Some(b) = evdi_banner {
+            children.push(widget::divider::horizontal::default().into());
             children.push(b);
         }
         if let Some(b) = portal_row {
@@ -522,11 +446,6 @@ impl Application for App {
             children.push(widget::divider::horizontal::default().into());
             children.push(c);
         }
-        children.extend([
-            widget::divider::horizontal::default().into(),
-            widget::text::heading("Host logs").into(),
-            log_pane.into(),
-        ]);
         let body = widget::column::with_children(children)
             .spacing(spacing.space_m)
             .max_width(520);
@@ -542,15 +461,6 @@ impl Application for App {
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
-            Message::ModeSelected(idx) => {
-                if let Some(m) = MODE_OPTIONS.get(idx).copied() {
-                    if m != self.mode {
-                        self.mode = m;
-                        return Task::done(cosmic::Action::App(Message::RestartHost));
-                    }
-                }
-                Task::none()
-            }
             Message::TransportSelected(idx) => {
                 if let Some(t) = TRANSPORT_OPTIONS.get(idx).copied() {
                     if t != self.transport {
@@ -572,82 +482,6 @@ impl Application for App {
                         }
                     }
                 }
-                Task::none()
-            }
-            Message::RestartHost => {
-                let exe = self.host_exe.clone();
-                let mode = self.mode.as_env().to_string();
-                let child_arc = self.child.clone();
-                let logs = self.logs.clone();
-                {
-                    let mut g = logs.lock().unwrap();
-                    g.clear();
-                }
-                self.status = format!("Starting in {} mode...", mode);
-                Task::perform(
-                    async move {
-                        // Stop any prior child first.
-                        {
-                            let mut guard = child_arc.lock().await;
-                            if let Some(mut c) = guard.take() {
-                                let _ = c.start_kill();
-                                let _ = c.wait().await;
-                            }
-                        }
-                        match spawn_host(&exe, &mode, logs).await {
-                            Ok(c) => {
-                                let pid = c.id().unwrap_or(0);
-                                *child_arc.lock().await = Some(c);
-                                Ok(pid)
-                            }
-                            Err(e) => Err(e.to_string()),
-                        }
-                    },
-                    |r| {
-                        let msg = match r {
-                            Ok(pid) => Message::HostStarted(pid),
-                            Err(e) => {
-                                warn!("start failed: {e}");
-                                Message::HostExited(None)
-                            }
-                        };
-                        cosmic::Action::App(msg)
-                    },
-                )
-            }
-            Message::HostStarted(pid) => {
-                self.running_pid = Some(pid);
-                self.status = format!("Running (pid {})", pid);
-                let child = self.child.clone();
-                Task::perform(
-                    async move {
-                        // Wait for the child in a background task so Stop can
-                        // still grab the `Mutex` to kill it; we drop the lock
-                        // between waiting ticks.
-                        loop {
-                            {
-                                let mut guard = child.lock().await;
-                                if let Some(c) = guard.as_mut() {
-                                    if let Ok(Some(status)) = c.try_wait() {
-                                        *guard = None;
-                                        return status.code();
-                                    }
-                                } else {
-                                    return None;
-                                }
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                        }
-                    },
-                    |r| cosmic::Action::App(Message::HostExited(r)),
-                )
-            }
-            Message::HostExited(code) => {
-                self.running_pid = None;
-                self.status = match code {
-                    Some(c) => format!("Stopped (exit {})", c),
-                    None => "Stopped".into(),
-                };
                 Task::none()
             }
             Message::TouchOutputSelected(idx) => {
@@ -739,61 +573,6 @@ fn qr_png_for_url(text: &str) -> Option<Vec<u8>> {
         .map_err(|e| warn!("qr encode failed: {e}"))
         .ok()?;
     Some(png)
-}
-
-async fn spawn_host(exe: &std::path::Path, mode: &str, logs: LogBuf) -> anyhow::Result<Child> {
-    info!(?exe, mode, "spawning host");
-    let mut child = Command::new(exe)
-        .env("FERRITE_MODE", mode)
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    tokio::spawn(async move {
-        let mut out = stdout.map(BufReader::new).map(|r| r.lines());
-        let mut err = stderr.map(BufReader::new).map(|r| r.lines());
-        loop {
-            tokio::select! {
-                line = async {
-                    match out.as_mut() {
-                        Some(o) => o.next_line().await,
-                        None => Ok(None),
-                    }
-                } => {
-                    match line {
-                        Ok(Some(l)) => append_log(&logs, l),
-                        _ => { out = None; }
-                    }
-                }
-                line = async {
-                    match err.as_mut() {
-                        Some(e) => e.next_line().await,
-                        None => Ok(None),
-                    }
-                } => {
-                    match line {
-                        Ok(Some(l)) => append_log(&logs, l),
-                        _ => { err = None; }
-                    }
-                }
-            }
-            if out.is_none() && err.is_none() {
-                break;
-            }
-        }
-    });
-    Ok(child)
-}
-
-fn append_log(buf: &LogBuf, line: String) {
-    let mut g = buf.lock().unwrap();
-    if g.len() >= LOG_LINES_MAX {
-        g.pop_front();
-    }
-    g.push_back(line);
 }
 
 fn main() -> anyhow::Result<()> {
