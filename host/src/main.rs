@@ -1,3 +1,4 @@
+mod aoa;
 mod capture;
 mod h264_dump;
 mod h264_stream;
@@ -15,9 +16,8 @@ use h264_stream::H264Encoder;
 use input::{InputSink, PEN_NAME_PREFIX, TOUCH_NAME_PREFIX};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, watch};
 use tracing::{debug, error, info, warn};
 use virtual_display::VirtualDisplayHandle;
@@ -27,11 +27,25 @@ type Clients = Arc<Mutex<HashMap<String, ClientStatus>>>;
 const ADDR: &str = "0.0.0.0:7543";
 const STREAM_FPS: u32 = 60;
 const READ_CHUNK: usize = 64 * 1024;
-/// Fixed 8-byte preamble the host writes at session start. The client drains
-/// bytes until it matches this so any stale data left in the transport gets
-/// discarded before bincode parsing begins. Matters most for AOA (accessory
-/// bulk buffers survive across sessions), but cheap to do on TCP too.
+/// Preamble the host writes at session start. The client drains bytes until
+/// it matches the 8-byte magic prefix, flushing any stale transport bytes.
+/// Padding is filler after the magic — enough that the USB bulk write is
+/// comfortably above any small-packet coalescing thresholds on the Android
+/// side, while still ending on a non-max-packet boundary so a short-packet
+/// terminates the transfer.
 const SYNC_MAGIC: &[u8] = b"FERRITE\0";
+const SYNC_PREAMBLE: &[u8] = &{
+    let mut a = [0xA5u8; 511]; // 511 bytes: short-packet-friendly (< 512)
+    a[0] = b'F';
+    a[1] = b'E';
+    a[2] = b'R';
+    a[3] = b'R';
+    a[4] = b'I';
+    a[5] = b'T';
+    a[6] = b'E';
+    a[7] = 0;
+    a
+};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -93,6 +107,44 @@ async fn main() -> Result<()> {
         });
     }
 
+    // AOA listener: blocks on a plugged-in Android device entering accessory
+    // mode, bridges its bulk endpoints into a tokio AsyncRead+AsyncWrite pair,
+    // hands that pair to the same `handle()` the TCP listener uses. Set
+    // FERRITE_AOA=0 to disable.
+    if std::env::var("FERRITE_AOA").ok().as_deref() != Some("0") {
+        let shared_rx = shared_rx.clone();
+        let clients = clients.clone();
+        tokio::spawn(async move {
+            loop {
+                let stream = match tokio::task::spawn_blocking(aoa::AoaStream::wait_for_device)
+                    .await
+                {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "AOA wait_for_device failed");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "AOA blocking task panicked");
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                };
+                aoa::drain_stale(&stream);
+                let bridge = aoa::spawn_bridge(std::sync::Arc::new(stream));
+                let peer = "aoa".to_string();
+                info!("AOA client attached");
+                let res = handle(bridge, mode, shared_rx.clone(), &peer, clients.clone()).await;
+                clients.lock().await.remove(&peer);
+                match res {
+                    Ok(()) => info!("AOA stream ended"),
+                    Err(e) => error!(error = %e, "AOA handler failed"),
+                }
+            }
+        });
+    }
+
     let listener = TcpListener::bind(ADDR)
         .await
         .with_context(|| format!("bind {ADDR}"))?;
@@ -126,18 +178,22 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn handle(
-    sock: tokio::net::TcpStream,
+async fn handle<S>(
+    sock: S,
     mode: Mode,
     shared_rx: Option<FrameRx>,
     peer: &str,
     clients: Clients,
-) -> Result<()> {
-    let (mut reader, mut writer) = sock.into_split();
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (mut reader, mut writer) = tokio::io::split(sock);
 
-    // Sync preamble: client scans for this to flush any stale transport
-    // bytes. Matches `android_jni::SYNC_MAGIC`.
-    writer.write_all(SYNC_MAGIC).await?;
+    // Sync preamble: client scans for the first 8 bytes (SYNC_MAGIC) to
+    // flush any stale transport bytes; the rest is filler. Matches
+    // `android_jni::SYNC_MAGIC`.
+    writer.write_all(SYNC_PREAMBLE).await?;
 
     // First message must be Hello — drives monitor sizing + device naming.
     let hello = read_hello(&mut reader).await?;
@@ -222,7 +278,7 @@ async fn handle(
     Ok(())
 }
 
-async fn read_hello(reader: &mut OwnedReadHalf) -> Result<(String, u32, u32)> {
+async fn read_hello<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(String, u32, u32)> {
     let len = reader.read_u32().await.context("read hello length")? as usize;
     let mut buf = vec![0u8; len];
     reader.read_exact(&mut buf).await.context("read hello body")?;
@@ -255,9 +311,9 @@ async fn pump_rgb(mut rgb_rx: FrameRx, mut stdin: tokio::process::ChildStdin) ->
     }
 }
 
-async fn pump_h264(
+async fn pump_h264<W: AsyncWrite + Unpin>(
     mut stdout: tokio::process::ChildStdout,
-    mut sock: OwnedWriteHalf,
+    mut sock: W,
     width: u32,
     height: u32,
 ) -> Result<()> {
@@ -308,8 +364,8 @@ async fn pump_h264(
     }
 }
 
-async fn send_au(
-    sock: &mut OwnedWriteHalf,
+async fn send_au<W: AsyncWrite + Unpin>(
+    sock: &mut W,
     width: u32,
     height: u32,
     data: &[u8],
@@ -443,7 +499,10 @@ fn scan_evdi_connector() -> Option<String> {
     None
 }
 
-async fn pump_input(mut reader: OwnedReadHalf, input: Option<InputSink>) -> Result<()> {
+async fn pump_input<R: AsyncRead + Unpin>(
+    mut reader: R,
+    input: Option<InputSink>,
+) -> Result<()> {
     loop {
         let len = reader.read_u32().await? as usize;
         let mut buf = vec![0u8; len];

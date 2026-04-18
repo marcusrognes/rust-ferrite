@@ -31,11 +31,13 @@ fn android_log(s: &str) {
     }
 }
 
-/// Fixed preamble the host sends at session start. Must match
-/// `host::SYNC_MAGIC`. The client drains bytes until matching these 8 so any
-/// stale data left in the transport (common on AOA endpoints across sessions)
-/// gets discarded before bincode parsing begins.
+/// First bytes of the preamble the host sends at session start. The client
+/// scans for these 8 bytes, discarding any stale data before them, then
+/// consumes [`PREAMBLE_FILLER_LEN`] more bytes to align with the host's
+/// full write before bincode parsing begins. Keep in sync with
+/// `host::SYNC_MAGIC` / `host::SYNC_PREAMBLE`.
 const SYNC_MAGIC: &[u8] = b"FERRITE\0";
+const PREAMBLE_FILLER_LEN: usize = 503; // 511 total − 8 magic
 
 // -----------------------------------------------------------------------------
 // Shared: write half published so sendPointer/sendTouches can push upstream
@@ -195,6 +197,10 @@ fn run_protocol<R: Read>(
     callback: &JObject,
 ) -> anyhow::Result<()> {
     drain_to_magic(reader)?;
+    // Consume the rest of the host's preamble padding so our first frame
+    // read doesn't re-interpret filler bytes as a length prefix.
+    let mut filler = vec![0u8; PREAMBLE_FILLER_LEN];
+    reader.read_exact(&mut filler)?;
     android_log("sync magic received");
 
     // Write Hello via `writer` before publishing it. Do it in-place through a

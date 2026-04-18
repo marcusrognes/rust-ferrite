@@ -19,3 +19,4 @@ ron = "0.8"
 serde = { version = "1", features = ["derive"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 socket2 = "0.5"
+rusb = "0.9"

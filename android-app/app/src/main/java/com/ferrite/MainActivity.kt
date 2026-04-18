@@ -1,6 +1,12 @@
 package com.ferrite
 
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbAccessory
+import android.hardware.usb.UsbManager
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.net.Uri
@@ -29,6 +35,7 @@ private const val MIME = "video/avc"
 private const val PREFS = "ferrite"
 private const val KEY_HOST = "host"
 private const val KEY_PORT = "port"
+private const val ACTION_USB_PERMISSION = "com.ferrite.USB_PERMISSION"
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback {
     private lateinit var status: TextView
@@ -45,6 +52,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
     private val surfaceReady = AtomicBoolean(false)
     private val streamLoopActive = AtomicBoolean(false)
     @Volatile private var streamLoopShouldRun = false
+    // Takes priority over the probe loop's TCP choice when non-null.
+    @Volatile private var pendingAoaFd: Int = -1
+    // Wi-Fi is opt-in: the user taps "Connect Wi-Fi" before we use it.
+    // Cleared when the stream ends so we don't silently reconnect on drop.
+    @Volatile private var wifiOptIn = false
+    private lateinit var wifiBtn: Button
+    private var wifiProbeThread: Thread? = null
 
     private val bytesIn = AtomicLong(0)
     private val framesRendered = AtomicLong(0)
@@ -78,6 +92,16 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             text = "saved Wi-Fi target: $host:$port\nor plug in USB"
             alpha = 0.6f
         }
+        wifiBtn = Button(this).apply {
+            text = "Connect Wi-Fi ($host:$port)"
+            visibility = android.view.View.GONE
+            setOnClickListener {
+                wifiOptIn = true
+                isEnabled = false
+                text = "connecting..."
+                try { FerriteLib.disconnect() } catch (_: Throwable) {}
+            }
+        }
         val scanBtn = Button(this).apply {
             text = "Scan QR"
             setOnClickListener { scanQr() }
@@ -92,7 +116,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
                 .apply { bottomMargin = 16 })
             addView(savedTarget, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
-                .apply { bottomMargin = 32 })
+                .apply { bottomMargin = 24 })
+            addView(wifiBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT)
+                .apply { bottomMargin = 16 })
             addView(scanBtn, LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT))
         }
 
@@ -114,11 +140,41 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
     }
 
     private fun setStreamingUi(on: Boolean) {
-        if (!streaming.compareAndSet(!on, on)) return
+        // Always post the UI update — gating on an atomic flag meant that a
+        // previously-true state would silently skip the transition, leaving
+        // the welcome screen visible even once new frames were arriving.
+        val changed = streaming.getAndSet(on) != on
         runOnUiThread {
             welcome.visibility = if (on) android.view.View.GONE else android.view.View.VISIBLE
-            applyImmersive(on)
+            if (changed) applyImmersive(on)
+            if (on) {
+                stopWifiProbe()
+            } else {
+                wifiOptIn = false
+                wifiBtn.isEnabled = true
+                wifiBtn.text = "Connect Wi-Fi ($host:$port)"
+                startWifiProbe()
+            }
         }
+    }
+
+    private fun startWifiProbe() {
+        if (wifiProbeThread?.isAlive == true) return
+        wifiProbeThread = Thread({
+            while (!Thread.currentThread().isInterrupted) {
+                val reachable = probeReachable(host, port, 500)
+                runOnUiThread {
+                    wifiBtn.visibility =
+                        if (reachable) android.view.View.VISIBLE else android.view.View.GONE
+                }
+                try { Thread.sleep(2000) } catch (_: InterruptedException) { break }
+            }
+        }, "wifi-probe").also { it.start() }
+    }
+
+    private fun stopWifiProbe() {
+        wifiProbeThread?.interrupt()
+        wifiProbeThread = null
     }
 
     private fun applyImmersive(on: Boolean) {
@@ -178,6 +234,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
     override fun surfaceCreated(holder: SurfaceHolder) {
         surfaceReady.set(true)
         startStreamIfNeeded()
+        startWifiProbe()
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
@@ -230,15 +287,95 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
         }, "ferrite-stream").start()
     }
 
-    /** Probe available TCP targets in priority order; first reachable wins. */
+    /** Priority: AOA fd (if one was claimed via accessory intent) → adb-reverse
+     *  localhost TCP → saved Wi-Fi TCP (only if the user opted in via the
+     *  "Connect Wi-Fi" button). */
     private fun pickTransport(): Transport? {
+        val fd = pendingAoaFd
+        if (fd >= 0) {
+            pendingAoaFd = -1
+            return Transport.Aoa(fd)
+        }
         if (probeReachable("127.0.0.1", DEFAULT_PORT, 300)) {
             return Transport.Tcp("127.0.0.1", DEFAULT_PORT)
         }
-        if (probeReachable(host, port, 500)) {
+        if (wifiOptIn && probeReachable(host, port, 500)) {
+            wifiOptIn = false // one-shot — disconnect won't auto-reconnect Wi-Fi
             return Transport.Tcp(host, port)
         }
         return null
+    }
+
+    // -------- USB accessory intent handling --------
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        tryClaimAccessory(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter(ACTION_USB_PERMISSION)
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            registerReceiver(permissionReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(permissionReceiver, filter)
+        }
+        tryClaimAccessory(intent)
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try { unregisterReceiver(permissionReceiver) } catch (_: Throwable) {}
+    }
+
+    private fun tryClaimAccessory(intent: Intent?) {
+        val mgr = getSystemService(Context.USB_SERVICE) as UsbManager
+        val acc: UsbAccessory? =
+            if (intent?.action == UsbManager.ACTION_USB_ACCESSORY_ATTACHED) {
+                intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
+            } else {
+                mgr.accessoryList?.firstOrNull()
+            } ?: return
+
+        if (!mgr.hasPermission(acc)) {
+            Log.i(TAG, "requesting accessory permission")
+            val pi = PendingIntent.getBroadcast(
+                this, 0,
+                Intent(ACTION_USB_PERMISSION).setPackage(packageName),
+                PendingIntent.FLAG_MUTABLE,
+            )
+            mgr.requestPermission(acc, pi)
+            return
+        }
+
+        val pfd = try {
+            mgr.openAccessory(acc)
+        } catch (t: Throwable) {
+            Log.w(TAG, "openAccessory threw: ${t.message}")
+            return
+        } ?: run {
+            Log.w(TAG, "openAccessory returned null")
+            return
+        }
+        val fd = pfd.detachFd()
+        Log.i(TAG, "AOA accessory attached, fd=$fd")
+        // Nudge the existing stream loop: abort whatever TCP it's doing, then
+        // let it re-pick — `pickTransport` will return the AOA fd first.
+        pendingAoaFd = fd
+        try { FerriteLib.disconnect() } catch (_: Throwable) {}
+    }
+
+    private val permissionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action != ACTION_USB_PERMISSION) return
+            val granted =
+                intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)
+            Log.i(TAG, "usb permission result: $granted")
+            if (granted) tryClaimAccessory(null)
+        }
     }
 
     private fun stopStreamLoop() {

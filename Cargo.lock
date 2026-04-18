@@ -1710,6 +1710,7 @@ dependencies = [
  "libc",
  "pipewire",
  "ron 0.8.1",
+ "rusb",
  "serde",
  "serde_json",
  "socket2 0.5.10",

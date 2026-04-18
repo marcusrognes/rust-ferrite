@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Matches the AOA identifier strings sent by ferrite-host (aoa.rs). Keep
+     manufacturer/model/version in sync with the host-side constants. -->
+<resources>
+    <usb-accessory
+        manufacturer="co.dealdrive"
+        model="Ferrite"
+        version="1" />
+</resources>
