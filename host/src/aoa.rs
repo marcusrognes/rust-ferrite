@@ -183,7 +183,8 @@ pub fn spawn_bridge(stream: Arc<AoaStream>) -> DuplexStream {
                     _ => break,
                 };
                 let data = buf[..n].to_vec();
-                info!(n = data.len(), "aoa bridge: forwarding to device");
+                let head: Vec<String> = data.iter().take(16).map(|b| format!("{b:02x}")).collect();
+                info!(n = data.len(), head = head.join(" "), "aoa bridge: forwarding to device");
                 let s = s.clone();
                 let res = tokio::task::spawn_blocking(move || {
                     let mut offset = 0;

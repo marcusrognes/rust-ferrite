@@ -135,7 +135,8 @@ fn do_stream_tcp(
             .with_interval(Duration::from_secs(2)),
     );
     let writer = sock.try_clone().map_err(|e| anyhow::anyhow!("try_clone: {e}"))?;
-    run_protocol(env, &mut sock, Box::new(writer), device_name, width, height, callback)
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, sock);
+    run_protocol(env, &mut reader, Box::new(writer), device_name, width, height, callback)
 }
 
 // -----------------------------------------------------------------------------
@@ -178,7 +179,15 @@ fn do_stream_fd(
 ) -> anyhow::Result<()> {
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let writer_fd = owned.try_clone()?;
-    let mut reader = std::fs::File::from(owned);
+    // BufReader is load-bearing for AOA: Android's f_accessory driver gives
+    // each read(2) AT MOST ONE USB bulk transfer and DISCARDS remaining bytes
+    // when the caller asked for fewer bytes than the transfer contained. Our
+    // protocol reads a 4-byte length prefix then N bytes of body; if the host
+    // coalesced those into one USB transfer, `read_exact(4)` would drop the
+    // body. BufReader issues one large read up-front, capturing the whole
+    // transfer into user memory where split reads can drain it safely.
+    let reader_file = std::fs::File::from(owned);
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader_file);
     let writer = std::fs::File::from(writer_fd);
     AOA_FD.store(fd, Ordering::Relaxed);
     struct ClearFd;
