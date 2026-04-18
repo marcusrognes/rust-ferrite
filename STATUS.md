@@ -6,6 +6,7 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 
 - **Wi-Fi transport** (`main`) — TCP over LAN, QR-code pairing from the tablet.
 - **USB transport via `adb reverse`** — plug device, run `adb reverse tcp:7543 tcp:7543`, app auto-detects `127.0.0.1:7543`.
+- **AOA (Android Open Accessory) transport** — plug device, Android app auto-launches via accessory intent, host enters accessory mode, video + input flow over USB bulk endpoints. No `adb reverse` dance. Reconnects on replug without restarting the host. Requires the packaged udev rule; activate with `FERRITE_AOA=1` (on by default in the host binary).
 - **Mirror mode** — captures an existing display via xdg-desktop-portal + PipeWire.
 - **Virtual monitor mode** (`FERRITE_MODE=virtual`) — evdi-backed second monitor, sized to the client's screen via `Hello`. Shows in cosmic as `DVI-I-N external display`. Torn down on disconnect.
 - **Multi-touch** — MT-B protocol to uinput, per-finger slot tracking.
@@ -19,14 +20,13 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 
 ## Doesn't work
 
-- **AOA (Android Open Accessory) transport** — lives on the `aoa-experiment` branch. Handshake + video direction (host → tablet) work, but the input direction (tablet → host) desyncs on the first Hello after each reconnect. Root cause seems to be stale bytes in the USB bulk IN endpoint surviving across sessions; sync-magic preamble and host-side drain mitigate but don't fully fix. Activate with `FERRITE_AOA=1` once fixed.
 - **Intra-refresh H.264** — only libx264 supports it; would mean giving up VAAPI hardware encoding. Skipped.
 
 ## Dependencies
 
 System deps (install once): `libpipewire-0.3-dev`, `libspa-0.2-dev`, `libclang-dev`, `clang`, `libavcodec-dev`, `libavformat-dev`, `libavutil-dev`, `mesa-va-drivers`, `evdi-dkms`, `libevdi-dev`, JDK 17+.
 
-When packaging for distribution: the AOA transport (on the experiment branch) requires a udev rule installed to `/etc/udev/rules.d/51-ferrite-aoa.rules` — can't be done from a user-mode binary, must come from the package's post-install script.
+When packaging for distribution: the AOA transport requires a udev rule installed to `/etc/udev/rules.d/51-ferrite-aoa.rules` — can't be done from a user-mode binary, must come from the package's post-install script.
 
 ## Run
 
