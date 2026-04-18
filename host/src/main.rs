@@ -27,6 +27,11 @@ type Clients = Arc<Mutex<HashMap<String, ClientStatus>>>;
 const ADDR: &str = "0.0.0.0:7543";
 const STREAM_FPS: u32 = 60;
 const READ_CHUNK: usize = 64 * 1024;
+/// Fixed 8-byte preamble the host writes at session start. The client drains
+/// bytes until it matches this so any stale data left in the transport gets
+/// discarded before bincode parsing begins. Matters most for AOA (accessory
+/// bulk buffers survive across sessions), but cheap to do on TCP too.
+const SYNC_MAGIC: &[u8] = b"FERRITE\0";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -128,7 +133,11 @@ async fn handle(
     peer: &str,
     clients: Clients,
 ) -> Result<()> {
-    let (mut reader, writer) = sock.into_split();
+    let (mut reader, mut writer) = sock.into_split();
+
+    // Sync preamble: client scans for this to flush any stale transport
+    // bytes. Matches `android_jni::SYNC_MAGIC`.
+    writer.write_all(SYNC_MAGIC).await?;
 
     // First message must be Hello — drives monitor sizing + device naming.
     let hello = read_hello(&mut reader).await?;

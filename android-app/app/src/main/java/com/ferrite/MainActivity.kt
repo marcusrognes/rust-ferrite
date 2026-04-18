@@ -203,26 +203,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
         Thread(null, {
             try {
                 while (streamLoopShouldRun) {
-                    val savedHost = host
-                    val savedPort = port
-                    // Re-probe each iteration so plugging in USB or starting
-                    // the host afterwards is picked up automatically.
-                    val target = when {
-                        probeReachable("127.0.0.1", DEFAULT_PORT, 300) ->
-                            "127.0.0.1" to DEFAULT_PORT
-                        probeReachable(savedHost, savedPort, 500) ->
-                            savedHost to savedPort
-                        else -> null
-                    }
-                    if (target == null) {
+                    // Pick a transport each iteration so plugging in USB or
+                    // starting the host afterwards is picked up automatically.
+                    // AOA is handled via a separate intent path and not
+                    // probed here.
+                    val transport = pickTransport()
+                    if (transport == null) {
                         runOnUiThread { status.text = "waiting for host..." }
                         Thread.sleep(2000)
                         continue
                     }
-                    val (h, p) = target
-                    runOnUiThread { status.text = "connecting $h:$p..." }
+                    runOnUiThread { status.text = "connecting ${transport.label()}..." }
                     try {
-                        FerriteLib.stream(h, p, name, w, ht, this)
+                        transport.run(name, w, ht, this)
                         runOnUiThread { status.text = "disconnected, retrying..." }
                     } catch (e: Throwable) {
                         Log.w(TAG, "stream ended: ${e.message}")
@@ -235,6 +228,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
                 streamLoopActive.set(false)
             }
         }, "ferrite-stream").start()
+    }
+
+    /** Probe available TCP targets in priority order; first reachable wins. */
+    private fun pickTransport(): Transport? {
+        if (probeReachable("127.0.0.1", DEFAULT_PORT, 300)) {
+            return Transport.Tcp("127.0.0.1", DEFAULT_PORT)
+        }
+        if (probeReachable(host, port, 500)) {
+            return Transport.Tcp(host, port)
+        }
+        return null
     }
 
     private fun stopStreamLoop() {

@@ -1,5 +1,13 @@
+//! JNI layer for the Android client. Exposes the Ferrite wire protocol over
+//! any bidirectional byte stream — currently TCP (Wi-Fi or adb-reverse) and
+//! AOA bulk fds. Both transports converge on a single `run_protocol` helper;
+//! adding a new transport means writing one more entry point that hands a
+//! `Read + Write` to that helper.
+
+use std::ffi::CString;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -8,13 +16,39 @@ use jni::JNIEnv;
 use jni::objects::{JByteArray, JClass, JFloatArray, JIntArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jfloat, jint, jstring};
 
-/// Write-half of the active stream socket, shared with `sendTouch` on the
-/// Kotlin side so it can push `ClientMessage` upstream without opening a
-/// second connection.
-fn tx_sock() -> &'static Mutex<Option<TcpStream>> {
-    static S: OnceLock<Mutex<Option<TcpStream>>> = OnceLock::new();
+fn android_log(s: &str) {
+    extern "C" {
+        fn __android_log_write(prio: i32, tag: *const u8, text: *const u8) -> i32;
+    }
+    let tag = CString::new("ferrite-jni").unwrap();
+    let msg = CString::new(s).unwrap();
+    unsafe {
+        __android_log_write(
+            4, // INFO
+            tag.as_ptr() as *const u8,
+            msg.as_ptr() as *const u8,
+        );
+    }
+}
+
+/// Fixed preamble the host sends at session start. Must match
+/// `host::SYNC_MAGIC`. The client drains bytes until matching these 8 so any
+/// stale data left in the transport (common on AOA endpoints across sessions)
+/// gets discarded before bincode parsing begins.
+const SYNC_MAGIC: &[u8] = b"FERRITE\0";
+
+// -----------------------------------------------------------------------------
+// Shared: write half published so sendPointer/sendTouches can push upstream
+// without opening a second connection. Set to `Some` between the Hello write
+// and the protocol loop exiting; cleared on scope exit via `ClearOnDrop`.
+
+fn tx_writer() -> &'static Mutex<Option<Box<dyn Write + Send>>> {
+    static S: OnceLock<Mutex<Option<Box<dyn Write + Send>>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
 }
+
+// -----------------------------------------------------------------------------
+// Legacy health check kept around for the Kotlin side's `connect()` call.
 
 #[no_mangle]
 pub extern "system" fn Java_com_ferrite_FerriteLib_connect(
@@ -24,14 +58,14 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_connect(
     env.new_string("ferrite-android ready").unwrap().into_raw()
 }
 
-/// Opens a TCP connection to `host:port`, sends `Hello` (so the host can size
-/// its virtual monitor + name our input devices), and then loops forever
-/// reading length-prefixed `bincode` `HostMessage::VideoFrame`s, calling
-/// `callback.onFrame(byte[], int, int, int)` for each frame. Blocks the caller
-/// until the connection errors or the callback throws. Throws
-/// `java.lang.RuntimeException` on any I/O / protocol / JNI error.
+// -----------------------------------------------------------------------------
+// TCP transport (Wi-Fi or adb-reverse localhost).
+
+/// Opens a TCP connection to `host:port` and hands it to the shared protocol
+/// loop. Blocks the caller until the connection errors or the callback
+/// throws. Throws `java.lang.RuntimeException` on any I/O or protocol error.
 #[no_mangle]
-pub extern "system" fn Java_com_ferrite_FerriteLib_stream<'l>(
+pub extern "system" fn Java_com_ferrite_FerriteLib_streamTcp<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     host: JString<'l>,
@@ -55,7 +89,7 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_stream<'l>(
             return;
         }
     };
-    if let Err(e) = do_stream(
+    if let Err(e) = do_stream_tcp(
         &mut env,
         &host_str,
         port as u16,
@@ -70,7 +104,7 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_stream<'l>(
     }
 }
 
-fn do_stream(
+fn do_stream_tcp(
     env: &mut JNIEnv,
     host: &str,
     port: u16,
@@ -80,9 +114,10 @@ fn do_stream(
     callback: &JObject,
 ) -> anyhow::Result<()> {
     let mut sock = TcpStream::connect((host, port))?;
-    // No read timeout: host may go idle between frames when nothing changes on
-    // screen. But enable TCP keepalive so the kernel detects a dead connection
-    // (e.g. USB cable yanked) within ~10s instead of the default ~2 hours.
+    // No read timeout: host may go idle between frames when nothing changes
+    // on screen. But enable TCP keepalive so the kernel detects a dead
+    // connection (e.g. USB cable yanked) within ~10s instead of the default
+    // ~2 hours.
     let sock2 = socket2::SockRef::from(&sock);
     let _ = sock2.set_keepalive(true);
     let _ = sock2.set_tcp_keepalive(
@@ -90,29 +125,107 @@ fn do_stream(
             .with_time(Duration::from_secs(5))
             .with_interval(Duration::from_secs(2)),
     );
-
-    // Publish a write-half clone so `sendTouch` can push ClientMessages.
     let writer = sock.try_clone().map_err(|e| anyhow::anyhow!("try_clone: {e}"))?;
-    *tx_sock().lock().unwrap() = Some(writer);
+    run_protocol(env, &mut sock, Box::new(writer), device_name, width, height, callback)
+}
 
-    // Hello drives host-side monitor sizing + device naming.
+// -----------------------------------------------------------------------------
+// AOA fd transport. Takes ownership of a UNIX fd obtained from
+// `UsbManager.openAccessory(...)`. The read and write halves are two dup'd
+// Files pointing at the same bidirectional socketpair, so writes from the
+// background `tx_writer` path don't interfere with the protocol reader.
+
+#[no_mangle]
+pub extern "system" fn Java_com_ferrite_FerriteLib_streamFd<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    fd: jint,
+    device_name: JString<'l>,
+    width: jint,
+    height: jint,
+    callback: JObject<'l>,
+) {
+    let name_str: String = match env.get_string(&device_name) {
+        Ok(s) => s.into(),
+        Err(e) => {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("bad device_name: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = do_stream_fd(&mut env, fd, &name_str, width as u32, height as u32, &callback) {
+        if !env.exception_check().unwrap_or(false) {
+            let _ = env.throw_new("java/lang/RuntimeException", format!("{e:#}"));
+        }
+    }
+}
+
+fn do_stream_fd(
+    env: &mut JNIEnv,
+    fd: jint,
+    device_name: &str,
+    width: u32,
+    height: u32,
+    callback: &JObject,
+) -> anyhow::Result<()> {
+    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+    let writer_fd = owned.try_clone()?;
+    let mut reader = std::fs::File::from(owned);
+    let writer = std::fs::File::from(writer_fd);
+    run_protocol(env, &mut reader, Box::new(writer), device_name, width, height, callback)
+}
+
+// -----------------------------------------------------------------------------
+// Shared protocol loop. Transport-agnostic — any `Read + Write` works.
+//
+// Flow:
+//   1. Drain stale bytes until SYNC_MAGIC received from host.
+//   2. Write Hello (device_name + dimensions).
+//   3. Publish a clone of the write half as `tx_writer` so sendPointer /
+//      sendTouches can push upstream without racing Hello.
+//   4. Loop reading length-prefixed `HostMessage`s, handing frames to the
+//      Kotlin callback.
+
+fn run_protocol<R: Read>(
+    env: &mut JNIEnv,
+    reader: &mut R,
+    writer: Box<dyn Write + Send>,
+    device_name: &str,
+    width: u32,
+    height: u32,
+    callback: &JObject,
+) -> anyhow::Result<()> {
+    drain_to_magic(reader)?;
+    android_log("sync magic received");
+
+    // Write Hello via `writer` before publishing it. Do it in-place through a
+    // small owned handle; after that the boxed writer goes into tx_writer.
+    let mut w = writer;
     let hello = bincode::serialize(&ClientMessage::Hello {
         device_name: device_name.to_string(),
         width,
         height,
     })?;
-    write_frame(&mut sock, &hello)?;
-    // On scope exit (loop breaks via ?), clear the slot so stale writes bail.
+    write_frame(&mut *w, &hello)?;
+
+    *tx_writer().lock().unwrap() = Some(w);
     struct ClearOnDrop;
     impl Drop for ClearOnDrop {
         fn drop(&mut self) {
-            *tx_sock().lock().unwrap() = None;
+            *tx_writer().lock().unwrap() = None;
         }
     }
     let _guard = ClearOnDrop;
 
+    read_loop(env, reader, callback)
+}
+
+fn read_loop<R: Read>(
+    env: &mut JNIEnv,
+    reader: &mut R,
+    callback: &JObject,
+) -> anyhow::Result<()> {
     loop {
-        let buf = read_frame(&mut sock)?;
+        let buf = read_frame(reader)?;
         let msg: HostMessage = bincode::deserialize(&buf)?;
         let (fmt, data, width, height) = match msg {
             HostMessage::VideoFrame {
@@ -122,7 +235,12 @@ fn do_stream(
                 height,
             } => (format, data, width, height),
             HostMessage::Ping => {
-                write_frame(&mut sock, &bincode::serialize(&ClientMessage::Pong)?)?;
+                let pong = bincode::serialize(&ClientMessage::Pong)?;
+                // Pong goes through tx_writer so the reader loop isn't
+                // blocked on acquiring the writer.
+                if let Some(w) = tx_writer().lock().unwrap().as_mut() {
+                    write_frame(&mut **w, &pong)?;
+                }
                 continue;
             }
         };
@@ -141,7 +259,6 @@ fn do_stream(
             PixelFormat::H264 => 2,
         };
 
-        // Use a fresh local frame so the jbyteArray is freed each iteration.
         env.with_local_frame::<_, _, anyhow::Error>(4, |env| {
             let arr: JByteArray = env.byte_array_from_slice(&data)?;
             env.call_method(
@@ -165,8 +282,27 @@ fn do_stream(
     }
 }
 
-/// Send a multi-touch snapshot. `ids/xs/ys` are parallel arrays of currently
-/// down fingers; an empty list means all fingers released.
+/// Scan the stream for [`SYNC_MAGIC`], discarding everything before the match.
+fn drain_to_magic<R: Read>(sock: &mut R) -> std::io::Result<()> {
+    let mut matched = 0;
+    let mut byte = [0u8; 1];
+    while matched < SYNC_MAGIC.len() {
+        sock.read_exact(&mut byte)?;
+        if byte[0] == SYNC_MAGIC[matched] {
+            matched += 1;
+        } else if byte[0] == SYNC_MAGIC[0] {
+            matched = 1;
+        } else {
+            matched = 0;
+        }
+    }
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Upstream writers (touch + pointer) — go through `tx_writer` regardless of
+// transport.
+
 #[no_mangle]
 pub extern "system" fn Java_com_ferrite_FerriteLib_sendTouches<'l>(
     mut env: JNIEnv<'l>,
@@ -200,31 +336,7 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_sendTouches<'l>(
             y: y_buf[i],
         })
         .collect();
-    let bytes = match bincode::serialize(&ClientMessage::Touches { points }) {
-        Ok(b) => b,
-        Err(_) => return,
-    };
-    let mut guard = tx_sock().lock().unwrap();
-    if let Some(sock) = guard.as_mut() {
-        let len = (bytes.len() as u32).to_be_bytes();
-        if sock.write_all(&len).is_err() || sock.write_all(&bytes).is_err() {
-            *guard = None;
-        }
-    }
-}
-
-/// Force-close the active stream socket. Causes the blocking `stream()` JNI
-/// call to unwind via I/O error so the caller can start a new connection
-/// without waiting for the host to time out.
-#[no_mangle]
-pub extern "system" fn Java_com_ferrite_FerriteLib_disconnect(
-    _env: JNIEnv,
-    _class: JClass,
-) {
-    let mut g = tx_sock().lock().unwrap();
-    if let Some(s) = g.take() {
-        let _ = s.shutdown(std::net::Shutdown::Both);
-    }
+    send_upstream(&ClientMessage::Touches { points });
 }
 
 /// `tool`: 0 = Finger, 1 = Pen, 2 = Eraser. Anything else is treated as Finger.
@@ -244,28 +356,45 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_sendPointer(
         2 => PointerTool::Eraser,
         _ => PointerTool::Finger,
     };
-    let msg = ClientMessage::Pointer {
+    send_upstream(&ClientMessage::Pointer {
         x: x as f32,
         y: y as f32,
         pressed: pressed != 0,
         pressure: pressure as f32,
         tool,
         in_range: in_range != 0,
-    };
-    let bytes = match bincode::serialize(&msg) {
+    });
+}
+
+fn send_upstream(msg: &ClientMessage) {
+    let bytes = match bincode::serialize(msg) {
         Ok(b) => b,
         Err(_) => return,
     };
-    let mut guard = tx_sock().lock().unwrap();
-    if let Some(sock) = guard.as_mut() {
+    let mut guard = tx_writer().lock().unwrap();
+    if let Some(w) = guard.as_mut() {
         let len = (bytes.len() as u32).to_be_bytes();
-        if sock.write_all(&len).is_err() || sock.write_all(&bytes).is_err() {
+        if w.write_all(&len).is_err() || w.write_all(&bytes).is_err() {
             *guard = None;
         }
     }
 }
 
-fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+/// Drop the writer, which closes the socket/fd and unblocks the blocking
+/// stream call with an I/O error. Lets the caller abandon a transport that's
+/// wedged (e.g. USB yanked) without waiting for the far-end keepalive to fire.
+#[no_mangle]
+pub extern "system" fn Java_com_ferrite_FerriteLib_disconnect(
+    _env: JNIEnv,
+    _class: JClass,
+) {
+    tx_writer().lock().unwrap().take();
+}
+
+// -----------------------------------------------------------------------------
+// Framing helpers.
+
+fn read_frame<R: Read + ?Sized>(sock: &mut R) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     sock.read_exact(&mut len)?;
     let len = u32::from_be_bytes(len) as usize;
@@ -274,7 +403,7 @@ fn read_frame(sock: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn write_frame(sock: &mut TcpStream, bytes: &[u8]) -> std::io::Result<()> {
+fn write_frame<W: Write + ?Sized>(sock: &mut W, bytes: &[u8]) -> std::io::Result<()> {
     sock.write_all(&(bytes.len() as u32).to_be_bytes())?;
     sock.write_all(bytes)?;
     Ok(())
