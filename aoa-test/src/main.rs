@@ -89,9 +89,10 @@ fn run_once(allow_prompt_wait: bool, payload_size: usize) -> Result<()> {
     }
     println!("[3] drained {drained} stale bytes");
 
-    let pattern: Vec<u8> = (0..payload_size).map(|i| (i & 0xff) as u8).collect();
+    // Pattern uses 0..0xFE so heartbeat markers (0xFF 0xFF) are separable.
+    let pattern: Vec<u8> = (0..payload_size).map(|i| (i % 0xff) as u8).collect();
     println!(
-        "[4] writing {} bytes + concurrently reading echo",
+        "[4] writing {} bytes + concurrently reading echo (0xFFFF = heartbeat)",
         pattern.len()
     );
 
@@ -100,20 +101,42 @@ fn run_once(allow_prompt_wait: bool, payload_size: usize) -> Result<()> {
     let pattern_arc = Arc::new(pattern);
     let reply_size = pattern_arc.len();
 
-    // Reader thread — pulls echo bytes off the IN endpoint concurrently with
-    // the main thread's write. Without this, Android's OUT-buffer fills and
-    // our write stalls.
+    // Reader thread: pulls echo + heartbeat bytes off the IN endpoint
+    // concurrently with the main thread's write. Demuxes 0xFF 0xFF markers
+    // out of the stream, counts them, and accumulates echoed pattern bytes
+    // until reply_size pattern bytes have been received.
     let rh = handle.clone();
-    let reader = thread::spawn(move || -> Result<Vec<u8>> {
-        let mut reply = vec![0u8; reply_size];
-        let mut filled = 0;
-        while filled < reply.len() {
+    let reader = thread::spawn(move || -> Result<(Vec<u8>, u32)> {
+        let mut echoed: Vec<u8> = Vec::with_capacity(reply_size);
+        let mut hb_count: u32 = 0;
+        let mut buf = vec![0u8; 64 * 1024];
+        let mut pending_ff = false; // split heartbeat across read boundaries
+        while echoed.len() < reply_size {
             let n = rh
-                .read_bulk(ep_in, &mut reply[filled..], Duration::from_secs(10))
-                .with_context(|| format!("read_bulk after {filled}/{reply_size}"))?;
-            filled += n;
+                .read_bulk(ep_in, &mut buf, Duration::from_secs(10))
+                .with_context(|| format!("read_bulk at {} echoed", echoed.len()))?;
+            let mut i = 0;
+            while i < n {
+                let b = buf[i];
+                if pending_ff {
+                    if b == 0xff {
+                        hb_count += 1;
+                    } else {
+                        echoed.push(0xff);
+                        echoed.push(b);
+                    }
+                    pending_ff = false;
+                    i += 1;
+                } else if b == 0xff {
+                    pending_ff = true;
+                    i += 1;
+                } else {
+                    echoed.push(b);
+                    i += 1;
+                }
+            }
         }
-        Ok(reply)
+        Ok((echoed, hb_count))
     });
 
     // Writer on the main thread.
@@ -151,11 +174,17 @@ fn run_once(allow_prompt_wait: bool, payload_size: usize) -> Result<()> {
     }
     println!("[4] written OK");
 
-    let reply = reader.join().map_err(|_| anyhow!("reader thread panicked"))??;
-    println!("[5] read {} bytes back", reply.len());
+    let (reply, hb_count) = reader
+        .join()
+        .map_err(|_| anyhow!("reader thread panicked"))??;
+    println!(
+        "[5] read {} echoed bytes + {} heartbeats",
+        reply.len(),
+        hb_count
+    );
 
     if reply == *pattern_arc {
-        println!("[6] ECHO MATCHES ({} bytes)", reply.len());
+        println!("[6] ECHO MATCHES ({} bytes, {} heartbeats)", reply.len(), hb_count);
     } else {
         println!("[6] MISMATCH:");
         for (i, (s, r)) in pattern_arc.iter().zip(reply.iter()).enumerate() {

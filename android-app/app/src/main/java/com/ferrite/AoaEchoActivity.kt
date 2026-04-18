@@ -75,10 +75,16 @@ class AoaEchoActivity : AppCompatActivity() {
             return
         }
         pfd = fd
-        status.text = "connected fd=${fd.fd}; echoing"
+        status.text = "connected fd=${fd.fd}; echoing + heartbeats"
 
         val input = FileInputStream(fd.fileDescriptor)
         val output = FileOutputStream(fd.fileDescriptor)
+        // Shared lock so heartbeat writes don't interleave with echo writes.
+        val outputLock = Any()
+
+        // Echo thread: read from host, write back. Synchronized with heartbeat
+        // thread on outputLock — each write_all is atomic relative to the
+        // other path.
         worker = Thread({
             val buf = ByteArray(64 * 1024)
             var total = 0L
@@ -87,19 +93,37 @@ class AoaEchoActivity : AppCompatActivity() {
                     val n = input.read(buf)
                     if (n < 0) break
                     if (n == 0) continue
-                    output.write(buf, 0, n)
-                    output.flush()
+                    synchronized(outputLock) {
+                        output.write(buf, 0, n)
+                        output.flush()
+                    }
                     total += n
-                    val msg = "echoed $total bytes"
-                    runOnUiThread { status.text = msg }
-                    Log.i(TAG, msg)
                 }
+                Log.i(TAG, "echo loop exited after $total bytes")
             } catch (e: Throwable) {
                 Log.w(TAG, "echo ended", e)
-                val msg = "disconnected: ${e.message}"
-                runOnUiThread { status.text = msg }
+                runOnUiThread { status.text = "echo ended: ${e.message}" }
             }
         }, "aoa-echo").also { it.start() }
+
+        // Heartbeat thread: writes a 2-byte marker (0xFF 0xFF) every 100ms.
+        // The host test pattern is restricted to bytes 0..0xFE so heartbeats
+        // are trivially separable from echoed content.
+        Thread({
+            val hb = byteArrayOf(0xFF.toByte(), 0xFF.toByte())
+            try {
+                while (!Thread.currentThread().isInterrupted) {
+                    synchronized(outputLock) {
+                        output.write(hb)
+                        output.flush()
+                    }
+                    Thread.sleep(100)
+                }
+            } catch (_: InterruptedException) {
+            } catch (e: Throwable) {
+                Log.w(TAG, "heartbeat ended", e)
+            }
+        }, "aoa-heartbeat").start()
     }
 
     companion object {
