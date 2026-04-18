@@ -348,19 +348,58 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
 
     private fun handleTouch(viewW: Int, viewH: Int, e: MotionEvent): Boolean {
         if (viewW <= 0 || viewH <= 0) return false
-        val x = (e.x / viewW).coerceIn(0f, 1f)
-        val y = (e.y / viewH).coerceIn(0f, 1f)
-        val pressed = when (e.actionMasked) {
-            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> true
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> false
-            else -> return false
+
+        // Pen / eraser → single Pointer with pressure + proximity. Pen events
+        // never have pointerCount > 1 in practice so no MT split needed.
+        val firstTool = toolFor(e)
+        if (firstTool != 0) {
+            val x = (e.x / viewW).coerceIn(0f, 1f)
+            val y = (e.y / viewH).coerceIn(0f, 1f)
+            val pressed = when (e.actionMasked) {
+                MotionEvent.ACTION_DOWN, MotionEvent.ACTION_MOVE -> true
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> false
+                else -> return false
+            }
+            val pressure = e.pressure.coerceIn(0f, 1f)
+            try {
+                FerriteLib.sendPointer(x, y, pressed, pressure, firstTool, true)
+            } catch (t: Throwable) {
+                Log.w(TAG, "sendPointer failed", t)
+            }
+            return true
         }
-        val pressure = e.pressure.coerceIn(0f, 1f)
-        val tool = toolFor(e)
+
+        // Finger touches → snapshot of every currently-down pointer. On
+        // ACTION_(POINTER_)UP the lifted pointer is still in the event but
+        // about to release, so exclude it from the snapshot.
+        val released: Int = when (e.actionMasked) {
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> -2 // all up
+            MotionEvent.ACTION_POINTER_UP -> e.actionIndex
+            else -> -1
+        }
+        val n = e.pointerCount
+        val capacity = if (released == -2) 0 else n
+        val ids = IntArray(capacity)
+        val xs = FloatArray(capacity)
+        val ys = FloatArray(capacity)
+        var k = 0
+        if (released != -2) {
+            for (i in 0 until n) {
+                if (i == released) continue
+                ids[k] = e.getPointerId(i)
+                xs[k] = (e.getX(i) / viewW).coerceIn(0f, 1f)
+                ys[k] = (e.getY(i) / viewH).coerceIn(0f, 1f)
+                k++
+            }
+        }
+        // Trim if we excluded one.
+        val actualIds = if (k == capacity) ids else ids.copyOf(k)
+        val actualXs = if (k == capacity) xs else xs.copyOf(k)
+        val actualYs = if (k == capacity) ys else ys.copyOf(k)
         try {
-            FerriteLib.sendPointer(x, y, pressed, pressure, tool, true)
+            FerriteLib.sendTouches(actualIds, actualXs, actualYs)
         } catch (t: Throwable) {
-            Log.w(TAG, "sendPointer failed", t)
+            Log.w(TAG, "sendTouches failed", t)
         }
         return true
     }

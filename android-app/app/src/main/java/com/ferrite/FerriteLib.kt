@@ -50,6 +50,12 @@ object FerriteLib {
         inRange: Boolean,
     )
 
+    /**
+     * Push a multi-touch snapshot. Parallel arrays of currently-down finger
+     * ids and normalized [0,1] positions. Empty arrays = all fingers up.
+     */
+    external fun sendTouches(ids: IntArray, xs: FloatArray, ys: FloatArray)
+
     /** Aborts the current `stream()` blocking call by closing the socket. */
     external fun disconnect()
 }

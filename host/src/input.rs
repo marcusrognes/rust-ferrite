@@ -16,14 +16,16 @@
 //! `~/.config/cosmic/com.system76.CosmicComp/v1/input_devices` config (the UI
 //! exposes the touchscreen one).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use ferrite_core::PointerTool;
+use ferrite_core::{PointerTool, TouchPoint};
 use input_linux::sys::{
-    input_event, timeval, ABS_PRESSURE, ABS_X, ABS_Y, BTN_TOOL_FINGER, BTN_TOOL_PEN,
-    BTN_TOOL_RUBBER, BTN_TOUCH, EV_ABS, EV_KEY, EV_SYN, SYN_REPORT,
+    input_event, timeval, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
+    ABS_PRESSURE, ABS_X, ABS_Y, BTN_TOOL_FINGER, BTN_TOOL_PEN, BTN_TOOL_RUBBER, BTN_TOUCH, EV_ABS,
+    EV_KEY, EV_SYN, SYN_REPORT,
 };
 use input_linux::{
     AbsoluteAxis, AbsoluteInfo, AbsoluteInfoSetup, EventKind, InputId, InputProperty, Key,
@@ -33,6 +35,7 @@ use tracing::info;
 
 const ABS_MAX: i32 = 0xFFFF;
 const PRESSURE_MAX: i32 = 1023;
+const MAX_SLOTS: i32 = 10;
 
 pub const TOUCH_NAME_PREFIX: &str = "ferrite virtual touchscreen";
 pub const PEN_NAME_PREFIX: &str = "ferrite virtual pen";
@@ -43,9 +46,18 @@ struct Dev {
     last_tool: Option<i32>, // last asserted BTN_TOOL_*; for the pen device only
 }
 
+struct TouchDev {
+    handle: UInputHandle<File>,
+    /// Maps client-side pointer id (Android `getPointerId`) to a uinput slot
+    /// number in `[0, MAX_SLOTS)`. Slot allocation is first-free.
+    slots: HashMap<u32, i32>,
+    last_any_pressed: bool,
+    last_active_slot: i32,
+}
+
 #[derive(Clone)]
 pub struct InputSink {
-    touch: Arc<Mutex<Dev>>,
+    touch: Arc<Mutex<TouchDev>>,
     pen: Arc<Mutex<Dev>>,
     mirror_pen_to_touch: bool,
 }
@@ -68,7 +80,7 @@ impl InputSink {
         })
     }
 
-    pub fn send(
+    pub fn send_pointer(
         &self,
         x: f32,
         y: f32,
@@ -77,29 +89,93 @@ impl InputSink {
         tool: PointerTool,
         in_range: bool,
     ) {
-        match tool {
-            PointerTool::Finger => self.send_finger(x, y, pressed),
-            PointerTool::Pen | PointerTool::Eraser => {
-                let was_pressed = self.pen.lock().unwrap().last_pressed;
-                self.send_pen(x, y, pressed, pressure, tool, in_range);
-                if self.mirror_pen_to_touch && (pressed || was_pressed) {
-                    self.send_finger(x, y, pressed);
-                }
-            }
+        // Pen/eraser path. Finger touches now arrive via `send_touches` so we
+        // ignore PointerTool::Finger here; legacy callers should not send it.
+        if matches!(tool, PointerTool::Finger) {
+            return;
+        }
+        self.send_pen(x, y, pressed, pressure, tool, in_range);
+        if self.mirror_pen_to_touch {
+            // Mirror the pen position onto the touch device as a single-finger
+            // touch so non-tablet apps see cursor movement on the mapped output.
+            let single = if pressed {
+                vec![TouchPoint { id: u32::MAX, x, y }]
+            } else {
+                Vec::new()
+            };
+            self.send_touches(&single);
         }
     }
 
-    fn send_finger(&self, x: f32, y: f32, pressed: bool) {
-        let xi = (x.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
-        let yi = (y.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
+    /// Snapshot-based MT-B emission. `points` is the full set of currently-down
+    /// fingers; anything previously down but absent here is released.
+    pub fn send_touches(&self, points: &[TouchPoint]) {
         let mut dev = self.touch.lock().unwrap();
-        let mut events = vec![event(EV_ABS, ABS_X, xi), event(EV_ABS, ABS_Y, yi)];
-        if pressed != dev.last_pressed {
-            let v = if pressed { 1 } else { 0 };
-            events.push(event(EV_KEY, BTN_TOOL_FINGER, v));
-            events.push(event(EV_KEY, BTN_TOUCH, v));
-            dev.last_pressed = pressed;
+        let mut events: Vec<input_event> = Vec::with_capacity(points.len() * 4 + 6);
+
+        // Release slots whose pointer ids are no longer present.
+        let still_down: std::collections::HashSet<u32> = points.iter().map(|p| p.id).collect();
+        let to_release: Vec<u32> = dev
+            .slots
+            .keys()
+            .copied()
+            .filter(|id| !still_down.contains(id))
+            .collect();
+        for id in to_release {
+            let slot = dev.slots.remove(&id).expect("slot just present");
+            if dev.last_active_slot != slot {
+                events.push(event(EV_ABS, ABS_MT_SLOT, slot));
+                dev.last_active_slot = slot;
+            }
+            events.push(event(EV_ABS, ABS_MT_TRACKING_ID, -1));
         }
+
+        // Down + move active fingers.
+        for p in points {
+            let xi = (p.x.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
+            let yi = (p.y.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
+            let new_finger = !dev.slots.contains_key(&p.id);
+            let slot = if new_finger {
+                let used: std::collections::HashSet<i32> = dev.slots.values().copied().collect();
+                let mut s = 0;
+                while used.contains(&s) {
+                    s += 1;
+                }
+                if s >= MAX_SLOTS {
+                    continue; // out of slots; drop this finger
+                }
+                dev.slots.insert(p.id, s);
+                s
+            } else {
+                dev.slots[&p.id]
+            };
+            if dev.last_active_slot != slot {
+                events.push(event(EV_ABS, ABS_MT_SLOT, slot));
+                dev.last_active_slot = slot;
+            }
+            if new_finger {
+                events.push(event(EV_ABS, ABS_MT_TRACKING_ID, p.id as i32));
+            }
+            events.push(event(EV_ABS, ABS_MT_POSITION_X, xi));
+            events.push(event(EV_ABS, ABS_MT_POSITION_Y, yi));
+        }
+
+        // Single-touch ABS_X/Y emulation for legacy clients (uses first finger).
+        if let Some(first) = points.first() {
+            let xi = (first.x.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
+            let yi = (first.y.clamp(0.0, 1.0) * ABS_MAX as f32) as i32;
+            events.push(event(EV_ABS, ABS_X, xi));
+            events.push(event(EV_ABS, ABS_Y, yi));
+        }
+
+        let any_pressed = !points.is_empty();
+        if any_pressed != dev.last_any_pressed {
+            let v = if any_pressed { 1 } else { 0 };
+            events.push(event(EV_KEY, BTN_TOUCH, v));
+            events.push(event(EV_KEY, BTN_TOOL_FINGER, v));
+            dev.last_any_pressed = any_pressed;
+        }
+
         events.push(event(EV_SYN, SYN_REPORT, 0));
         let _ = dev.handle.write(&events);
     }
@@ -169,7 +245,7 @@ impl InputSink {
     }
 }
 
-fn create_touch(device_name: &str) -> Result<Dev> {
+fn create_touch(device_name: &str) -> Result<TouchDev> {
     let file = File::options()
         .write(true)
         .read(true)
@@ -179,13 +255,14 @@ fn create_touch(device_name: &str) -> Result<Dev> {
     h.set_evbit(EventKind::Key)?;
     h.set_evbit(EventKind::Absolute)?;
     h.set_evbit(EventKind::Synchronize)?;
-    // No ButtonLeft — its presence makes libinput classify the device as a
-    // pointer/mouse instead of a touchscreen, which then bypasses the
-    // touch-only `map_to_output` config in cosmic-comp.
     h.set_keybit(Key::ButtonTouch)?;
     h.set_keybit(Key::ButtonToolFinger)?;
     h.set_absbit(AbsoluteAxis::X)?;
     h.set_absbit(AbsoluteAxis::Y)?;
+    h.set_absbit(AbsoluteAxis::MultitouchSlot)?;
+    h.set_absbit(AbsoluteAxis::MultitouchTrackingId)?;
+    h.set_absbit(AbsoluteAxis::MultitouchPositionX)?;
+    h.set_absbit(AbsoluteAxis::MultitouchPositionY)?;
     h.set_propbit(InputProperty::Direct)?;
     let id = InputId {
         bustype: 3,
@@ -193,11 +270,11 @@ fn create_touch(device_name: &str) -> Result<Dev> {
         product: 0x17e0,
         version: 1,
     };
-    let abs = |axis, max| AbsoluteInfoSetup {
+    let abs = |axis, min, max| AbsoluteInfoSetup {
         axis,
         info: AbsoluteInfo {
             value: 0,
-            minimum: 0,
+            minimum: min,
             maximum: max,
             fuzz: 0,
             flat: 0,
@@ -209,13 +286,22 @@ fn create_touch(device_name: &str) -> Result<Dev> {
         &id,
         name.as_bytes(),
         0,
-        &[abs(AbsoluteAxis::X, ABS_MAX), abs(AbsoluteAxis::Y, ABS_MAX)],
+        &[
+            abs(AbsoluteAxis::X, 0, ABS_MAX),
+            abs(AbsoluteAxis::Y, 0, ABS_MAX),
+            abs(AbsoluteAxis::MultitouchSlot, 0, MAX_SLOTS - 1),
+            // TRACKING_ID is signed: -1 = release, otherwise the client id.
+            abs(AbsoluteAxis::MultitouchTrackingId, -1, i32::MAX),
+            abs(AbsoluteAxis::MultitouchPositionX, 0, ABS_MAX),
+            abs(AbsoluteAxis::MultitouchPositionY, 0, ABS_MAX),
+        ],
     )?;
-    info!(name, "touchscreen device created at /dev/uinput");
-    Ok(Dev {
+    info!(name, "multi-touch device created at /dev/uinput");
+    Ok(TouchDev {
         handle: h,
-        last_pressed: false,
-        last_tool: None,
+        slots: HashMap::new(),
+        last_any_pressed: false,
+        last_active_slot: -1,
     })
 }
 

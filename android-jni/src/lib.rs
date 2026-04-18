@@ -3,9 +3,9 @@ use std::net::TcpStream;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use ferrite_core::{ClientMessage, HostMessage, PixelFormat, PointerTool};
+use ferrite_core::{ClientMessage, HostMessage, PixelFormat, PointerTool, TouchPoint};
 use jni::JNIEnv;
-use jni::objects::{JByteArray, JClass, JObject, JString, JValue};
+use jni::objects::{JByteArray, JClass, JFloatArray, JIntArray, JObject, JString, JValue};
 use jni::sys::{jboolean, jfloat, jint, jstring};
 
 /// Write-half of the active stream socket, shared with `sendTouch` on the
@@ -162,6 +162,54 @@ fn do_stream(
             }
             Ok(())
         })?;
+    }
+}
+
+/// Send a multi-touch snapshot. `ids/xs/ys` are parallel arrays of currently
+/// down fingers; an empty list means all fingers released.
+#[no_mangle]
+pub extern "system" fn Java_com_ferrite_FerriteLib_sendTouches<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    ids: JIntArray<'l>,
+    xs: JFloatArray<'l>,
+    ys: JFloatArray<'l>,
+) {
+    let n = match env.get_array_length(&ids) {
+        Ok(n) => n as usize,
+        Err(_) => return,
+    };
+    let mut id_buf = vec![0i32; n];
+    let mut x_buf = vec![0f32; n];
+    let mut y_buf = vec![0f32; n];
+    if n > 0 {
+        if env.get_int_array_region(&ids, 0, &mut id_buf).is_err() {
+            return;
+        }
+        if env.get_float_array_region(&xs, 0, &mut x_buf).is_err() {
+            return;
+        }
+        if env.get_float_array_region(&ys, 0, &mut y_buf).is_err() {
+            return;
+        }
+    }
+    let points: Vec<TouchPoint> = (0..n)
+        .map(|i| TouchPoint {
+            id: id_buf[i] as u32,
+            x: x_buf[i],
+            y: y_buf[i],
+        })
+        .collect();
+    let bytes = match bincode::serialize(&ClientMessage::Touches { points }) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let mut guard = tx_sock().lock().unwrap();
+    if let Some(sock) = guard.as_mut() {
+        let len = (bytes.len() as u32).to_be_bytes();
+        if sock.write_all(&len).is_err() || sock.write_all(&bytes).is_err() {
+            *guard = None;
+        }
     }
 }
 

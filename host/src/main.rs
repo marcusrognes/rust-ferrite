@@ -451,7 +451,13 @@ async fn pump_input(mut reader: OwnedReadHalf, input: Option<InputSink>) -> Resu
             } => {
                 debug!(?tool, x, y, pressed, pressure, in_range, "pointer");
                 if let Some(s) = input.as_ref() {
-                    s.send(x, y, pressed, pressure, tool, in_range);
+                    s.send_pointer(x, y, pressed, pressure, tool, in_range);
+                }
+            }
+            ClientMessage::Touches { points } => {
+                debug!(n = points.len(), "touches");
+                if let Some(s) = input.as_ref() {
+                    s.send_touches(&points);
                 }
             }
             ClientMessage::Hello { .. } => {} // ignore stray re-hellos

@@ -53,6 +53,15 @@ pub enum PointerTool {
     Eraser,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TouchPoint {
+    /// Stable per-finger identifier from the client's input layer (Android
+    /// `getPointerId`). Host maps these to MT slots.
+    pub id: u32,
+    pub x: f32,
+    pub y: f32,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum ClientMessage {
     /// First message after socket connect. `device_name` is shown in cosmic's
@@ -65,11 +74,8 @@ pub enum ClientMessage {
         width: u32,
         height: u32,
     },
-    /// Absolute pointer position normalized to `[0, 1]` within the Android view.
-    /// `pressure` is `[0, 1]`. `tool` lets the host decide whether to emit pen
-    /// or finger events on the virtual input device. `in_range` distinguishes
-    /// "tool present but lifted" (pen hover) from "tool gone"; finger always
-    /// reports `true` since capacitive screens have no proximity.
+    /// Pen / stylus / eraser only. Single tool with pressure + proximity.
+    /// Finger touches go through `Touches` for multi-touch support.
     Pointer {
         x: f32,
         y: f32,
@@ -77,6 +83,11 @@ pub enum ClientMessage {
         pressure: f32,
         tool: PointerTool,
         in_range: bool,
+    },
+    /// Snapshot of currently-down fingers. Empty list = all released. The host
+    /// diffs against the previous snapshot to emit Linux MT-B events.
+    Touches {
+        points: Vec<TouchPoint>,
     },
     Pong,
 }
