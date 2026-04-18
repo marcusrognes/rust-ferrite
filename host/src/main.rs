@@ -109,28 +109,28 @@ async fn main() -> Result<()> {
 
     // AOA listener: blocks on a plugged-in Android device entering accessory
     // mode, bridges its bulk endpoints into a tokio AsyncRead+AsyncWrite pair,
-    // hands that pair to the same `handle()` the TCP listener uses. Opt-in
-    // via FERRITE_AOA=1 — see STATUS.md for the reliability caveat.
-    if std::env::var("FERRITE_AOA").ok().as_deref() == Some("1") {
+    // hands that pair to the same `handle()` the TCP listener uses. Set
+    // FERRITE_AOA=0 to disable. Loops so the host can pick up a re-plugged
+    // cable without a restart.
+    if std::env::var("FERRITE_AOA").ok().as_deref() != Some("0") {
         let shared_rx = shared_rx.clone();
         let clients = clients.clone();
         tokio::spawn(async move {
             loop {
-                let stream = match tokio::task::spawn_blocking(aoa::AoaStream::wait_for_device)
-                    .await
-                {
-                    Ok(Ok(s)) => s,
-                    Ok(Err(e)) => {
-                        warn!(error = %e, "AOA wait_for_device failed");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "AOA blocking task panicked");
-                        tokio::time::sleep(Duration::from_secs(2)).await;
-                        continue;
-                    }
-                };
+                let stream =
+                    match tokio::task::spawn_blocking(aoa::AoaStream::wait_for_device).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "AOA wait_for_device failed, retrying");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "AOA blocking task panicked");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
                 aoa::drain_stale(&stream);
                 let bridge = aoa::spawn_bridge(std::sync::Arc::new(stream));
                 let peer = "aoa".to_string();
@@ -138,9 +138,13 @@ async fn main() -> Result<()> {
                 let res = handle(bridge, mode, shared_rx.clone(), &peer, clients.clone()).await;
                 clients.lock().await.remove(&peer);
                 match res {
-                    Ok(()) => info!("AOA stream ended"),
-                    Err(e) => error!(error = %e, "AOA handler failed"),
+                    Ok(()) => info!("AOA stream ended; waiting for reconnect"),
+                    Err(e) => warn!(error = %e, "AOA handler failed; waiting for reconnect"),
                 }
+                // Breather between sessions so Android has time to fire a
+                // fresh ACCESSORY_ATTACHED intent and its userspace reopens
+                // the accessory fd before we claim the interface again.
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
@@ -297,6 +301,13 @@ async fn pump_rgb(mut rgb_rx: FrameRx, mut stdin: tokio::process::ChildStdin) ->
     // Skip feeding ffmpeg when the captured pixels are unchanged from the
     // previous frame — saves the encoder + network the trip on idle screens.
     // xxh3 hashes ~15GB/s so a 2800x1720 RGB frame costs ~1ms.
+    //
+    // But never go fully idle: ffmpeg needs input flowing to emit IDRs
+    // (and Android's MediaCodec needs an IDR to configure). If nothing
+    // changes for >500ms, re-send the latest frame as a heartbeat so the
+    // encoder keeps producing output. Unchanged content compresses to
+    // near-zero P-frames, so the bandwidth cost is negligible.
+    const IDLE_HEARTBEAT: Duration = Duration::from_millis(500);
     let mut last_hash: Option<u64> = None;
     loop {
         let frame = rgb_rx.borrow_and_update().clone();
@@ -307,7 +318,18 @@ async fn pump_rgb(mut rgb_rx: FrameRx, mut stdin: tokio::process::ChildStdin) ->
                 last_hash = Some(h);
             }
         }
-        rgb_rx.changed().await.context("capture source ended")?;
+        tokio::select! {
+            r = rgb_rx.changed() => r.context("capture source ended")?,
+            _ = tokio::time::sleep(IDLE_HEARTBEAT) => {
+                // No new frame within the heartbeat window; resend the
+                // current one to keep the ffmpeg pipeline alive. Clone
+                // first so we don't hold the watch ref across the await.
+                let frame = rgb_rx.borrow().clone();
+                if let Some(frame) = frame {
+                    stdin.write_all(&frame.rgb).await?;
+                }
+            }
+        }
     }
 }
 

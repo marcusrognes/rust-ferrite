@@ -32,13 +32,13 @@ fn android_log(s: &str) {
     }
 }
 
-/// First bytes of the preamble the host sends at session start. The client
-/// scans for these 8 bytes, discarding any stale data before them, then
-/// consumes [`PREAMBLE_FILLER_LEN`] more bytes to align with the host's
-/// full write before bincode parsing begins. Keep in sync with
-/// `host::SYNC_MAGIC` / `host::SYNC_PREAMBLE`.
+/// Full preamble the host writes at session start. Must be exactly this many
+/// bytes and start with [`SYNC_MAGIC`]; the rest is filler the client
+/// discards. Reading the full preamble in one `read_exact` (rather than
+/// byte-by-byte scanning) avoids Android's accessory-fd small-read latency.
+/// Keep in sync with `host::SYNC_PREAMBLE`.
 const SYNC_MAGIC: &[u8] = b"FERRITE\0";
-const PREAMBLE_FILLER_LEN: usize = 503; // 511 total − 8 magic
+const PREAMBLE_LEN: usize = 511;
 
 // -----------------------------------------------------------------------------
 // Shared: write half published so sendPointer/sendTouches can push upstream
@@ -135,7 +135,8 @@ fn do_stream_tcp(
             .with_interval(Duration::from_secs(2)),
     );
     let writer = sock.try_clone().map_err(|e| anyhow::anyhow!("try_clone: {e}"))?;
-    run_protocol(env, &mut sock, Box::new(writer), device_name, width, height, callback)
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, sock);
+    run_protocol(env, &mut reader, Box::new(writer), device_name, width, height, callback)
 }
 
 // -----------------------------------------------------------------------------
@@ -178,7 +179,15 @@ fn do_stream_fd(
 ) -> anyhow::Result<()> {
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     let writer_fd = owned.try_clone()?;
-    let mut reader = std::fs::File::from(owned);
+    // BufReader is load-bearing for AOA: Android's f_accessory driver gives
+    // each read(2) AT MOST ONE USB bulk transfer and DISCARDS remaining bytes
+    // when the caller asked for fewer bytes than the transfer contained. Our
+    // protocol reads a 4-byte length prefix then N bytes of body; if the host
+    // coalesced those into one USB transfer, `read_exact(4)` would drop the
+    // body. BufReader issues one large read up-front, capturing the whole
+    // transfer into user memory where split reads can drain it safely.
+    let reader_file = std::fs::File::from(owned);
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader_file);
     let writer = std::fs::File::from(writer_fd);
     AOA_FD.store(fd, Ordering::Relaxed);
     struct ClearFd;
@@ -211,12 +220,40 @@ fn run_protocol<R: Read>(
     height: u32,
     callback: &JObject,
 ) -> anyhow::Result<()> {
-    drain_to_magic(reader)?;
-    // Consume the rest of the host's preamble padding so our first frame
-    // read doesn't re-interpret filler bytes as a length prefix.
-    let mut filler = vec![0u8; PREAMBLE_FILLER_LEN];
-    reader.read_exact(&mut filler)?;
-    android_log("sync magic received");
+    // Read exactly PREAMBLE_LEN bytes and look for the magic. If there's
+    // stale data on the wire, the magic won't be at offset 0; we scan for
+    // it, then read exactly as many additional bytes as needed to make our
+    // position line up with the end of the preamble on the host side. No
+    // over-read — bytes after the preamble belong to real protocol frames
+    // and must stay on the wire for the next read_frame call.
+    let mut buf = vec![0u8; PREAMBLE_LEN];
+    reader.read_exact(&mut buf)?;
+    let stale_bytes = loop {
+        if let Some(pos) = memmem(&buf, SYNC_MAGIC) {
+            break pos;
+        }
+        // Magic not found in current window. It may have been split across
+        // boundaries or be further into the stream; slide the window.
+        // Keep the tail that could be a prefix of the magic.
+        let keep = SYNC_MAGIC.len() - 1;
+        let shift = buf.len() - keep;
+        buf.copy_within(shift.., 0);
+        reader.read_exact(&mut buf[keep..])?;
+        // Total stale bytes so far (for bail-out).
+        if buf.len() > 64 * 1024 {
+            anyhow::bail!("no sync magic in first 64K of stream");
+        }
+    };
+    // Preamble = SYNC_MAGIC (8) + FILLER (PREAMBLE_LEN-8). buf currently has
+    // `stale_bytes + PREAMBLE_LEN - stale_bytes = PREAMBLE_LEN` bytes, of
+    // which the first `stale_bytes` were junk and the next 8 were magic.
+    // We've read `PREAMBLE_LEN - stale_bytes - 8` filler bytes already;
+    // need `stale_bytes` more filler bytes to finish the preamble.
+    if stale_bytes > 0 {
+        let mut rest = vec![0u8; stale_bytes];
+        reader.read_exact(&mut rest)?;
+    }
+    android_log(&format!("sync magic received (stale={stale_bytes})"));
 
     // Write Hello via `writer` before publishing it. Do it in-place through a
     // small owned handle; after that the boxed writer goes into tx_writer.
@@ -245,8 +282,14 @@ fn read_loop<R: Read>(
     reader: &mut R,
     callback: &JObject,
 ) -> anyhow::Result<()> {
+    let mut first = true;
     loop {
         let buf = read_frame(reader)?;
+        if first {
+            let head: Vec<String> = buf.iter().take(16).map(|b| format!("{b:02x}")).collect();
+            android_log(&format!("first frame: len={} head=[{}]", buf.len(), head.join(" ")));
+            first = false;
+        }
         let msg: HostMessage = bincode::deserialize(&buf)?;
         let (fmt, data, width, height) = match msg {
             HostMessage::VideoFrame {
@@ -301,23 +344,6 @@ fn read_loop<R: Read>(
             Ok(())
         })?;
     }
-}
-
-/// Scan the stream for [`SYNC_MAGIC`], discarding everything before the match.
-fn drain_to_magic<R: Read>(sock: &mut R) -> std::io::Result<()> {
-    let mut matched = 0;
-    let mut byte = [0u8; 1];
-    while matched < SYNC_MAGIC.len() {
-        sock.read_exact(&mut byte)?;
-        if byte[0] == SYNC_MAGIC[matched] {
-            matched += 1;
-        } else if byte[0] == SYNC_MAGIC[0] {
-            matched = 1;
-        } else {
-            matched = 0;
-        }
-    }
-    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -419,6 +445,15 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_disconnect(
             libc::shutdown(fd, libc::SHUT_RDWR);
         }
     }
+}
+
+/// Minimal needle-in-haystack byte search. std's slice::contains doesn't help
+/// because we need the starting index, not just presence.
+fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 // -----------------------------------------------------------------------------

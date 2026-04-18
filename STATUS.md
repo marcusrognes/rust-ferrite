@@ -5,8 +5,9 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 ## Works
 
 - **Pluggable transports** — host side is generic over `AsyncRead + AsyncWrite`; client side has a `Transport` sealed class (`Tcp` + `Aoa`). Adding a new transport is one more `run_protocol` call site.
-- **Wi-Fi transport** (`main`) — TCP over LAN, QR-code pairing from the tablet. Opt-in via "Connect Wi-Fi" button on the tablet so the app doesn't auto-connect over the network.
-- **USB transport via `adb reverse`** — plug device, run `adb reverse tcp:7543 tcp:7543`, app auto-detects `127.0.0.1:7543`. First-class, always-available path.
+- **Wi-Fi transport** — TCP over LAN, QR-code pairing from the tablet. Opt-in via "Connect Wi-Fi" button on the tablet so the app doesn't auto-connect over the network.
+- **USB transport via `adb reverse`** — plug device, run `adb reverse tcp:7543 tcp:7543`, app auto-detects `127.0.0.1:7543`.
+- **AOA (Android Open Accessory) transport** — plug device, Android app auto-launches via accessory intent, host enters accessory mode, video + input flow over USB bulk endpoints. No `adb reverse` dance. Reconnects on replug without restarting the host. Enabled by default in the host (`FERRITE_AOA=0` to disable). Requires the packaged udev rule.
 - **Mirror mode** — captures an existing display via xdg-desktop-portal + PipeWire.
 - **Virtual monitor mode** (`FERRITE_MODE=virtual`) — evdi-backed second monitor, sized to the client's screen via `Hello`. Shows in cosmic as `DVI-I-N external display`. Torn down on disconnect.
 - **Multi-touch** — MT-B protocol to uinput, per-finger slot tracking.
@@ -17,10 +18,6 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 - **Auto cosmic input mapping** — host writes `~/.config/cosmic/com.system76.CosmicComp/v1/input_devices` with per-client device-name entries mapped to the freshly-created evdi connector.
 - **Low-latency H.264 streaming** — VAAPI hardware encoder, CQP rate mode, AUD framing, SPS/PPS at every keyframe. One access-unit per wire frame so the Android decoder gets clean MediaCodec inputs.
 - **Idle skip** — xxh3 hash of captured RGB; identical frames aren't re-encoded.
-
-## Partially works / experimental
-
-- **AOA (Android Open Accessory) transport** — code is on `main` but default-off; enable with `FERRITE_AOA=1`. The standalone echo test (`aoa-test` crate + `AoaEchoActivity`) proves the raw transport is clean (256 B, 1 MB, concurrent-write, session-reuse all pass). The full protocol inside MainActivity is inconsistent: first N sessions after a tablet reboot stream fine, subsequent reconnects hit an Android-side `UsbManager.openAccessory` state that returns `null` or throws "no accessory attached". Root cause appears to be Android's USB service getting wedged across rapid accessory re-attaches; can't be fixed from userspace. Worth revisiting if we find a way to reliably reset that state (`pm clear` + physical unplug mostly helps) or if we decide to ship a different USB protocol.
 
 ## Doesn't work
 
