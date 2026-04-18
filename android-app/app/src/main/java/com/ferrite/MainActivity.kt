@@ -86,6 +86,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setPadding(48, 48, 48, 48)
+            setBackgroundColor(android.graphics.Color.BLACK)
             addView(title, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
                 .apply { bottomMargin = 32 })
             addView(status, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT)
