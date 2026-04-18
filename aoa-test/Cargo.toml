@@ -1,0 +1,12 @@
+[package]
+name = "aoa-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "aoa-test"
+path = "src/main.rs"
+
+[dependencies]
+rusb = "0.9"
+anyhow = "1"
