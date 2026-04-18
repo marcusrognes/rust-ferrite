@@ -110,37 +110,41 @@ async fn main() -> Result<()> {
     // AOA listener: blocks on a plugged-in Android device entering accessory
     // mode, bridges its bulk endpoints into a tokio AsyncRead+AsyncWrite pair,
     // hands that pair to the same `handle()` the TCP listener uses. Set
-    // FERRITE_AOA=0 to disable.
-    //
-    // Single-session by design: when the session ends we DO NOT re-enter
-    // accessory mode automatically. Android's USB accessory driver takes
-    // 15-180 seconds to recover between sessions and any faster churn on our
-    // side confuses its state machine. Restart the host process to start a
-    // new AOA session.
+    // FERRITE_AOA=0 to disable. Loops so the host can pick up a re-plugged
+    // cable without a restart.
     if std::env::var("FERRITE_AOA").ok().as_deref() != Some("0") {
         let shared_rx = shared_rx.clone();
         let clients = clients.clone();
         tokio::spawn(async move {
-            let stream = match tokio::task::spawn_blocking(aoa::AoaStream::wait_for_device).await {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    warn!(error = %e, "AOA wait_for_device failed, giving up");
-                    return;
+            loop {
+                let stream =
+                    match tokio::task::spawn_blocking(aoa::AoaStream::wait_for_device).await {
+                        Ok(Ok(s)) => s,
+                        Ok(Err(e)) => {
+                            warn!(error = %e, "AOA wait_for_device failed, retrying");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "AOA blocking task panicked");
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                aoa::drain_stale(&stream);
+                let bridge = aoa::spawn_bridge(std::sync::Arc::new(stream));
+                let peer = "aoa".to_string();
+                info!("AOA client attached");
+                let res = handle(bridge, mode, shared_rx.clone(), &peer, clients.clone()).await;
+                clients.lock().await.remove(&peer);
+                match res {
+                    Ok(()) => info!("AOA stream ended; waiting for reconnect"),
+                    Err(e) => warn!(error = %e, "AOA handler failed; waiting for reconnect"),
                 }
-                Err(e) => {
-                    warn!(error = %e, "AOA blocking task panicked");
-                    return;
-                }
-            };
-            aoa::drain_stale(&stream);
-            let bridge = aoa::spawn_bridge(std::sync::Arc::new(stream));
-            let peer = "aoa".to_string();
-            info!("AOA client attached (single-session)");
-            let res = handle(bridge, mode, shared_rx, &peer, clients.clone()).await;
-            clients.lock().await.remove(&peer);
-            match res {
-                Ok(()) => info!("AOA stream ended; restart host to reconnect"),
-                Err(e) => error!(error = %e, "AOA handler failed; restart host to reconnect"),
+                // Breather between sessions so Android has time to fire a
+                // fresh ACCESSORY_ATTACHED intent and its userspace reopens
+                // the accessory fd before we claim the interface again.
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
