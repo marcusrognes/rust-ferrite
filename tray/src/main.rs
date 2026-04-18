@@ -250,7 +250,25 @@ impl ksni::Tray for Ferrite {
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
         let current_mode = self.mode;
+        let status = if !self.enabled {
+            "disabled".to_string()
+        } else if !self.running {
+            "host not running".to_string()
+        } else {
+            match self.clients {
+                0 => "waiting for client".to_string(),
+                1 => "1 client connected".to_string(),
+                n => format!("{n} clients connected"),
+            }
+        };
         vec![
+            StandardItem {
+                label: format!("Ferrite ({}) — {status}", self.mode_label()),
+                enabled: false,
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
             CheckmarkItem {
                 label: "Enabled".into(),
                 checked: self.enabled,

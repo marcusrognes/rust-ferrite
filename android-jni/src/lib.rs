@@ -5,9 +5,9 @@
 //! `Read + Write` to that helper.
 
 use std::ffi::CString;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
@@ -186,7 +186,14 @@ fn do_stream_fd(
     // coalesced those into one USB transfer, `read_exact(4)` would drop the
     // body. BufReader issues one large read up-front, capturing the whole
     // transfer into user memory where split reads can drain it safely.
-    let reader_file = std::fs::File::from(owned);
+    //
+    // TimeoutFile wraps it with a poll-based read timeout: the host's
+    // pump_rgb heartbeat sends a frame every ~500 ms, so any >5 s gap means
+    // the host died (or a cable was yanked). f_accessory doesn't surface
+    // that as an EOF, so we have to notice it ourselves — without this, a
+    // host shutdown leaves the Android worker blocked forever on read_exact
+    // and the tablet stuck on its last frame.
+    let reader_file = TimeoutFile::new(std::fs::File::from(owned), Duration::from_secs(5));
     let mut reader = std::io::BufReader::with_capacity(64 * 1024, reader_file);
     let writer = std::fs::File::from(writer_fd);
     AOA_FD.store(fd, Ordering::Relaxed);
@@ -444,6 +451,47 @@ pub extern "system" fn Java_com_ferrite_FerriteLib_disconnect(
         unsafe {
             libc::shutdown(fd, libc::SHUT_RDWR);
         }
+    }
+}
+
+/// File wrapper that applies a poll(2) read timeout. Used for the AOA
+/// accessory fd, which never surfaces host-side disconnects as EOF — a
+/// blocked `read` will otherwise wait forever. The timeout is handled at
+/// the single `read` call level, not cumulatively across `read_exact`
+/// retries, which is the behavior we actually want: any real gap is long
+/// enough to exceed the budget.
+struct TimeoutFile {
+    inner: std::fs::File,
+    fd: RawFd,
+    timeout: Duration,
+}
+
+impl TimeoutFile {
+    fn new(inner: std::fs::File, timeout: Duration) -> Self {
+        let fd = inner.as_raw_fd();
+        Self { inner, fd, timeout }
+    }
+}
+
+impl Read for TimeoutFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut pfd = libc::pollfd {
+            fd: self.fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = self.timeout.as_millis().min(i32::MAX as u128) as i32;
+        let ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if ret == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "accessory fd read timed out — host likely dead",
+            ));
+        }
+        self.inner.read(buf)
     }
 }
 
