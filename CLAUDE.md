@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Collaboration
+
+- **Commit after each successful change.** Default Claude Code behavior is to
+  wait for explicit commit requests — for this repo, commit automatically once
+  a change builds/tests/runs successfully. Commit message should describe the
+  why; one logical change per commit. Don't commit half-finished work.
+
 ## Purpose
 
 Duet-like system: use an Android device as an external display / pen tablet for a Linux host. Host captures screen + encodes + streams video to Android; Android returns touch/pen input.
