@@ -33,6 +33,8 @@ impl Mode {
 struct Config {
     #[serde(default)]
     mode: Option<Mode>,
+    #[serde(default)]
+    enabled: Option<bool>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -113,6 +115,7 @@ impl Drop for Host {
 struct Ferrite {
     host: Arc<Mutex<Host>>,
     mode: Mode,
+    enabled: bool,
 }
 
 impl ksni::Tray for Ferrite {
@@ -123,7 +126,12 @@ impl ksni::Tray for Ferrite {
         "Ferrite".into()
     }
     fn icon_name(&self) -> String {
-        "video-display".into()
+        // Grey out the tray glyph when the host isn't running.
+        if self.enabled {
+            "video-display".into()
+        } else {
+            "video-display-symbolic".into()
+        }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -134,6 +142,14 @@ impl ksni::Tray for Ferrite {
         use ksni::menu::*;
         let current_mode = self.mode;
         vec![
+            CheckmarkItem {
+                label: "Enabled".into(),
+                checked: self.enabled,
+                activate: Box::new(|this: &mut Self| this.set_enabled(!this.enabled)),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
             StandardItem {
                 label: "Open Panel".into(),
                 activate: Box::new(|_: &mut Self| open_panel()),
@@ -182,8 +198,29 @@ impl Ferrite {
             return;
         }
         self.mode = mode;
-        save_config(&Config { mode: Some(mode) });
-        self.host.lock().unwrap().start(mode);
+        save_config(&Config {
+            mode: Some(mode),
+            enabled: Some(self.enabled),
+        });
+        if self.enabled {
+            self.host.lock().unwrap().start(mode);
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        if enabled == self.enabled {
+            return;
+        }
+        self.enabled = enabled;
+        save_config(&Config {
+            mode: Some(self.mode),
+            enabled: Some(enabled),
+        });
+        if enabled {
+            self.host.lock().unwrap().start(self.mode);
+        } else {
+            self.host.lock().unwrap().stop();
+        }
     }
 }
 
@@ -204,13 +241,17 @@ fn main() {
 
     let cfg = load_config();
     let mode = cfg.mode.unwrap_or(Mode::Virtual);
+    let enabled = cfg.enabled.unwrap_or(true);
 
     let host = Arc::new(Mutex::new(Host::new()));
-    host.lock().unwrap().start(mode);
+    if enabled {
+        host.lock().unwrap().start(mode);
+    }
 
     let tray = Ferrite {
         host: host.clone(),
         mode,
+        enabled,
     };
     let handle = tray.spawn().expect("spawn tray service");
 
