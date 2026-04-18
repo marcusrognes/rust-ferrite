@@ -21,7 +21,6 @@ Running ledger of what works, what doesn't, and where half-finished experiments 
 ## Partially works / experimental
 
 - **AOA (Android Open Accessory) transport** — code is on `main` but default-off; enable with `FERRITE_AOA=1`. The standalone echo test (`aoa-test` crate + `AoaEchoActivity`) proves the raw transport is clean (256 B, 1 MB, concurrent-write, session-reuse all pass). The full protocol inside MainActivity is inconsistent: first N sessions after a tablet reboot stream fine, subsequent reconnects hit an Android-side `UsbManager.openAccessory` state that returns `null` or throws "no accessory attached". Root cause appears to be Android's USB service getting wedged across rapid accessory re-attaches; can't be fixed from userspace. Worth revisiting if we find a way to reliably reset that state (`pm clear` + physical unplug mostly helps) or if we decide to ship a different USB protocol.
-- **`aoa-experiment` branch** (historical) — earlier AOA integration attempt, kept for reference. All useful parts are on `main` now.
 
 ## Doesn't work
 
