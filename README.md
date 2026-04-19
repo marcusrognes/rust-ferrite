@@ -73,6 +73,14 @@ The APK lands at `android-app/app/build/outputs/apk/debug/app-debug.apk`. Instal
 
 ### Debian / Ubuntu / Pop!\_OS (.deb)
 
+Prebuilt `.deb` (amd64) and Android APK are attached to each [GitHub release](https://github.com/marcusrognes/rust-ferrite/releases). To install the latest:
+
+```bash
+sudo apt install ./ferrite_*.deb
+```
+
+To build locally instead:
+
 ```bash
 cargo install cargo-deb            # one-time
 cargo build --release

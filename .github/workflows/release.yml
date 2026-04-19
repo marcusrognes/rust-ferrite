@@ -1,0 +1,95 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    name: Build .deb (amd64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libclang-dev clang \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libevdi-dev libudev-dev \
+            libxkbcommon-dev libwayland-dev \
+            libfontconfig-dev libfreetype-dev \
+            libssl-dev libdbus-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Build release binaries
+        run: cargo build --release -p ferrite-tray -p ferrite-host -p ferrite-ui
+
+      - name: Build .deb
+        run: cargo deb -p ferrite-tray --no-build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrite-deb
+          path: target/debian/*.deb
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: target/debian/*.deb
+
+  apk:
+    name: Build APK (arm64 + x86_64)
+    runs-on: ubuntu-24.04
+    env:
+      NDK_VER: 26.1.10909125
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: 'platform-tools platforms;android-35 build-tools;34.0.0 ndk;26.1.10909125'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build APK
+        run: ./build-android.sh release
+
+      - name: Stage APK
+        run: |
+          mkdir -p dist
+          cp android-app/app/build/outputs/apk/debug/app-debug.apk \
+             "dist/ferrite-${GITHUB_REF_NAME:-dev}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ferrite-apk
+          path: dist/*.apk
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
