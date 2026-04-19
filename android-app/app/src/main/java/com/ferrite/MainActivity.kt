@@ -146,6 +146,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
         val changed = streaming.getAndSet(on) != on
         runOnUiThread {
             welcome.visibility = if (on) android.view.View.GONE else android.view.View.VISIBLE
+            // GONE on the SurfaceView destroys its hardware surface, taking
+            // the last-decoded frame with it. lockCanvas + drawColor doesn't
+            // actually clear the surface after MediaCodec has had it — the
+            // BufferQueue keeps the last producer frame cached in the
+            // compositor. Tearing the view down is the only reliable way.
+            // surfaceCreated fires again when we flip back to VISIBLE.
+            surfaceView.visibility = if (on) android.view.View.VISIBLE else android.view.View.GONE
             if (changed) applyImmersive(on)
             if (on) {
                 stopWifiProbe()
@@ -278,6 +285,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
                         Log.w(TAG, "stream ended: ${e.message}")
                         runOnUiThread { status.text = "err: ${e.message}, retrying..." }
                     }
+                    // Release the decoder so its last frame doesn't linger on
+                    // the surface into the next session. createCodecLocked is
+                    // called on-demand by onFrame when a new session starts.
+                    stopCodec()
                     setStreamingUi(false)
                     if (streamLoopShouldRun) Thread.sleep(1500)
                 }
@@ -576,6 +587,34 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, FrameCallback 
                 try { it.release() } catch (_: Throwable) {}
             }
             codec = null
+        }
+        clearSurface()
+    }
+
+    /**
+     * Paint the SurfaceView's surface black. MediaCodec renders straight to
+     * the hardware surface on its own compositor layer, so toggling
+     * SurfaceView visibility or overlaying welcome in the view hierarchy
+     * doesn't erase the last decoded frame — the cached pixels stay until
+     * something explicitly draws over them.
+     *
+     * Safe to call after [stopCodec] (the codec has released the surface)
+     * and before [createCodecLocked] reconfigures a new one.
+     */
+    private fun clearSurface() {
+        val holder = surfaceView.holder
+        val s = holder.surface ?: return
+        if (!s.isValid) return
+        var canvas: android.graphics.Canvas? = null
+        try {
+            canvas = holder.lockCanvas(null)
+            canvas?.drawColor(android.graphics.Color.BLACK)
+        } catch (t: Throwable) {
+            Log.w(TAG, "clearSurface failed", t)
+        } finally {
+            try {
+                if (canvas != null) holder.unlockCanvasAndPost(canvas)
+            } catch (_: Throwable) {}
         }
     }
 }
