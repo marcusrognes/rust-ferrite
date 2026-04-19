@@ -71,12 +71,27 @@ The APK lands at `android-app/app/build/outputs/apk/debug/app-debug.apk`. Instal
 
 ## Install
 
+### Debian / Ubuntu / Pop!\_OS (.deb)
+
+```bash
+cargo install cargo-deb            # one-time
+cargo build --release
+cargo deb -p ferrite-tray --no-build
+sudo apt install ./target/debian/ferrite_*.deb
+```
+
+Installs to `/usr/bin/`, drops the AOA udev rule into `/lib/udev/rules.d/`, and adds an XDG autostart entry under `/etc/xdg/autostart/`. Reload udev runs in the postinst. Log out + log in to start the tray, or run `ferrite-tray` directly.
+
+A systemd user unit is shipped at `/lib/systemd/user/ferrite-tray.service` — enable per-user with `systemctl --user enable --now ferrite-tray.service` if you prefer that over XDG autostart.
+
+### Per-user (no root, except for the udev rule)
+
 ```bash
 cargo build --release
 ./packaging/install.sh
 ```
 
-This copies the three binaries into `~/.local/bin`, adds an XDG autostart entry, and installs the AOA udev rule (needs `sudo` for the udev step).
+Copies the three binaries into `~/.local/bin`, adds an XDG autostart entry, and installs the AOA udev rule (needs `sudo` for the udev step).
 
 For a systemd-managed tray instead of XDG autostart:
 

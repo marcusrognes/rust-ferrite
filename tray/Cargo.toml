@@ -2,10 +2,38 @@
 name = "ferrite-tray"
 version = "0.1.0"
 edition = "2021"
+description = "Ferrite tray: use an Android tablet as a Linux external display + pen tablet"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/marcusrognes/rust-ferrite"
 
 [[bin]]
 name = "ferrite-tray"
 path = "src/main.rs"
+
+[package.metadata.deb]
+name = "ferrite"
+maintainer = "Marcus Rognes <marcus.rognes@dealdrive.co>"
+extended-description = """\
+Duet-like system: stream a Linux desktop (mirror or virtual evdi monitor) to an
+Android tablet over USB (AOA / adb-reverse) or Wi-Fi, with multi-touch and pen
+input routed back to the host via uinput.
+
+This package installs three binaries (ferrite-tray, ferrite-host, ferrite-ui),
+an AOA udev rule, an XDG autostart entry, and a systemd user service."""
+depends = "$auto, ffmpeg, xdg-desktop-portal, libpipewire-0.3-0"
+recommends = "evdi-dkms, mesa-va-drivers"
+section = "x11"
+priority = "optional"
+assets = [
+    ["target/release/ferrite-tray", "usr/bin/", "755"],
+    ["target/release/ferrite-host", "usr/bin/", "755"],
+    ["target/release/ferrite-ui",   "usr/bin/", "755"],
+    ["../packaging/ferrite-tray.desktop",       "etc/xdg/autostart/ferrite-tray.desktop", "644"],
+    ["../packaging/51-ferrite-aoa.rules",       "lib/udev/rules.d/51-ferrite-aoa.rules", "644"],
+    ["../packaging/debian/ferrite-tray.service",  "lib/systemd/user/ferrite-tray.service", "644"],
+    ["../README.md", "usr/share/doc/ferrite/README.md", "644"],
+]
+maintainer-scripts = "../packaging/debian/"
 
 [dependencies]
 ferrite-core = { path = "../core" }

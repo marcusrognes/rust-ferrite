@@ -2,7 +2,7 @@
 Type=Application
 Name=Ferrite Tray
 Comment=Android tablet as external display + pen tablet
-Exec=%h/.local/bin/ferrite-tray
+Exec=ferrite-tray
 Icon=video-display
 Categories=Utility;
 Terminal=false
