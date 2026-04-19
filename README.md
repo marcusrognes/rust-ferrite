@@ -42,14 +42,18 @@ Android NDK (API level 34+) on `PATH`; the NDK's `toolchains/llvm/prebuilt/linux
 
 ### Virtual monitor (evdi)
 
-Load the module once per boot and create a virtual card:
+The `.deb` install handles this for you: it pulls in `evdi-dkms`, loads the
+module at boot via `/lib/modules-load.d/ferrite.conf`, and runs a one-shot
+systemd unit (`ferrite-evdi-add.service`) that creates a virtual card under
+`/dev/dri/`. COSMIC then sees it as a "22.6\" DVI-I-N external display" once
+the first client connects.
+
+For non-package (source / `install.sh`) installs, do it manually once per boot:
 
 ```bash
 sudo modprobe evdi
 echo 1 | sudo tee /sys/devices/evdi/add
 ```
-
-A new `cardN` will appear in `/dev/dri/`. COSMIC will see it as a "22.6\" DVI-I-N external display" after the first client connect.
 
 ### AOA udev rule
 
@@ -88,7 +92,7 @@ cargo deb -p ferrite-tray --no-build
 sudo apt install ./target/debian/ferrite_*.deb
 ```
 
-Installs to `/usr/bin/`, drops the AOA udev rule into `/lib/udev/rules.d/`, and adds an XDG autostart entry under `/etc/xdg/autostart/`. Reload udev runs in the postinst. Log out + log in to start the tray, or run `ferrite-tray` directly.
+Installs to `/usr/bin/`, drops the AOA udev rule into `/lib/udev/rules.d/`, adds an XDG autostart entry under `/etc/xdg/autostart/`, and enables `ferrite-evdi-add.service` so an evdi virtual card is created at every boot. Reload udev runs in the postinst. Log out + log in to start the tray, or run `ferrite-tray` directly.
 
 A systemd user unit is shipped at `/lib/systemd/user/ferrite-tray.service` — enable per-user with `systemctl --user enable --now ferrite-tray.service` if you prefer that over XDG autostart.
 

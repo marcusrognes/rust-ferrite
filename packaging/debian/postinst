@@ -6,6 +6,15 @@ if [ "$1" = "configure" ]; then
         udevadm control --reload-rules || true
         udevadm trigger --subsystem-match=usb || true
     fi
+
+    # Load evdi now so users don't have to reboot / modprobe manually.
+    modprobe evdi 2>/dev/null || true
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl enable ferrite-evdi-add.service || true
+        systemctl start ferrite-evdi-add.service || true
+    fi
 fi
 
 #DEBHELPER#

@@ -19,9 +19,10 @@ Android tablet over USB (AOA / adb-reverse) or Wi-Fi, with multi-touch and pen
 input routed back to the host via uinput.
 
 This package installs three binaries (ferrite-tray, ferrite-host, ferrite-ui),
-an AOA udev rule, an XDG autostart entry, and a systemd user service."""
-depends = "$auto, ffmpeg, xdg-desktop-portal, libpipewire-0.3-0"
-recommends = "evdi-dkms, mesa-va-drivers"
+an AOA udev rule, an XDG autostart entry, a systemd user service, and a
+systemd oneshot that auto-creates an evdi virtual-display device at boot."""
+depends = "$auto, ffmpeg, xdg-desktop-portal, libpipewire-0.3-0, evdi-dkms"
+recommends = "mesa-va-drivers"
 section = "x11"
 priority = "optional"
 assets = [
@@ -31,6 +32,8 @@ assets = [
     ["../packaging/ferrite-tray.desktop",       "etc/xdg/autostart/ferrite-tray.desktop", "644"],
     ["../packaging/51-ferrite-aoa.rules",       "lib/udev/rules.d/51-ferrite-aoa.rules", "644"],
     ["../packaging/debian/ferrite-tray.service",  "lib/systemd/user/ferrite-tray.service", "644"],
+    ["../packaging/systemd/ferrite-evdi-add.service", "lib/systemd/system/ferrite-evdi-add.service", "644"],
+    ["../packaging/modules-load/ferrite.conf",  "lib/modules-load.d/ferrite.conf", "644"],
     ["../README.md", "usr/share/doc/ferrite/README.md", "644"],
 ]
 maintainer-scripts = "../packaging/debian/"

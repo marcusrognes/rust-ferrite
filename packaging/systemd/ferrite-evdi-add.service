@@ -1,0 +1,13 @@
+[Unit]
+Description=Create evdi virtual display device for ferrite
+After=systemd-modules-load.service
+Requires=systemd-modules-load.service
+ConditionPathExists=/sys/devices/evdi/add
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo 1 > /sys/devices/evdi/add'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
