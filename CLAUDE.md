@@ -28,7 +28,7 @@ Cargo workspace (`resolver = "2"`) with five crates plus an Android app:
 - **`host/`** (`ferrite-host`, bin) — Linux-side daemon. `tokio` runtime, `tracing` logging. Contains the capture + encode + stream pipeline (see "Host architecture" below).
 - **`tray/`** (`ferrite-tray`, bin) — the always-running process. Owns the `ferrite-host` child, publishes a StatusNotifierItem tray icon via `ksni`, spawns `ferrite-ui` on demand. Mode (mirror/virtual) is toggled from the tray menu and persisted to `$XDG_CONFIG_HOME/ferrite/tray.ron`. Expected to autostart at login.
 - **`ui/`** (`ferrite-ui`, bin) — libcosmic throwaway control panel. Reads `ferrite-host`'s status JSON, shows QR + connection info + clients + touch-mapping + transport toggle. Does NOT own the host process (tray does). Close = exit panel, host keeps running.
-- **`android-jni/`** (`ferrite-android`, `cdylib`) — native library loaded by the Android app over JNI (`jni` 0.21). Exports `Java_com_ferrite_FerriteLib_{connect,stream,sendPointer,sendTouches,disconnect}`. Produces `.so` files only.
+- **`android-jni/`** (`ferrite-android`, `cdylib`) — native library loaded by the Android app over JNI (`jni` 0.21). Exports `Java_com_ferrite_FerriteLib_{connect,streamTcp,streamFd,sendPointer,sendTouches,disconnect}`. `streamTcp` is used by the Wi-Fi and `adb reverse` transports; `streamFd` takes a raw USB accessory file descriptor for AOA. Produces `.so` files only.
 - **`android-app/`** — Android Gradle project (AGP 8.7.0, Kotlin 1.9.25, Gradle 8.9 via wrapper). Package `com.ferrite`. `MainActivity` uses a `SurfaceView` + `MediaCodec("video/avc")` decoder; `FerriteLib.stream(host, port, cb)` blocks a worker thread, firing `cb.onFrame(bytes, w, h, formatId)` per incoming H.264 chunk which is queued into MediaCodec input buffers. Built APK bundles `libferrite_android.so` for both `arm64-v8a` (device) and `x86_64` (emulator) under `app/src/main/jniLibs/<abi>/`. `local.properties` (gitignored) points at `~/Android/Sdk`.
 
 ## Build / dev commands
@@ -111,27 +111,31 @@ Two capture modes, selected by `FERRITE_MODE` env var (default `mirror`):
 
 Both modes publish `Arc<Frame { width, height, rgb }>` via `tokio::sync::watch` (lossy — slow consumers see only the latest frame, which is exactly what we want for live video).
 
-Per TCP client, `main.rs::handle()`:
-1. waits for first RGB frame to learn dimensions,
-2. spawns an `ffmpeg` subprocess (`h264_stream.rs::H264Encoder`) tuned for low-latency VA-API: `-vaapi_device /dev/dri/renderD128 -vf format=nv12,hwupload -c:v h264_vaapi -b:v 8M -g 60 -bf 0 -f h264 pipe:1`,
-3. `tokio::select!`s two halves: RGB watch → ffmpeg stdin, ffmpeg stdout → length-prefixed `VideoFrame { format: H264 }` bincode frames on the TCP socket. Each stdout read (up to 64 KB) becomes one `VideoFrame`; NAL/AU boundaries can fall anywhere in the chunk — MediaCodec on the Android side reassembles.
-4. On drop, `H264Encoder`'s `kill_on_drop(true)` SIGKILLs ffmpeg; the other half's I/O errors out.
+Per client (any transport — TCP, `adb reverse`, or AOA), `main.rs::handle()`:
+1. writes an 8-byte `SYNC_PREAMBLE` so the client can flush stale bytes, then reads `ClientMessage::Hello { name, w, h }` to learn device name + requested resolution,
+2. in `virtual` mode, spawns a per-client evdi monitor sized to `(w, h)`; in `mirror` mode, uses the shared capture `watch` source,
+3. creates per-client uinput devices via `input.rs::InputSink` — a multi-touch touchscreen and a pen tablet, both named after the client so COSMIC can remap them. In virtual mode, also writes a `~/.config/cosmic/com.system76.CosmicComp/v1/input_devices` entry pinning them to the freshly-created evdi connector,
+4. spawns an `ffmpeg` subprocess (`h264_stream.rs::H264Encoder`) tuned for low-latency VA-API: `h264_vaapi` with `-rc_mode CQP -qp 22 -quality 7 -g fps/2 -bf 0 -async_depth 1 -aud 1 -bsf:v dump_extra=freq=keyframe`. CQP keeps encoder pipeline depth minimal; AUDs make access units splittable; SPS/PPS at every IDR lets the decoder resync without a full GOP,
+5. `tokio::select!`s three halves: RGB watch → ffmpeg stdin, ffmpeg stdout → length-prefixed `VideoFrame { format: H264 }` bincode frames on the socket, and socket → `ClientMessage` decoding → `InputSink::pointer` / `InputSink::touches` dispatch,
+6. On drop, `H264Encoder`'s `kill_on_drop(true)` SIGKILLs ffmpeg and the evdi handle's Drop tears the virtual monitor down, so disconnect fully unplugs the client from both video and input sides.
 
 Numbers on this hardware (AMD GPU, emulator client): ~5 ms encode/frame (VA-API), ~500 KB/s wire, 30–60 fps rendered (emulator does software H.264 decode via MediaCodec SwVideoDecoder — on a real device with HW decoder it pegs 60 fps).
 
-### Virtual monitor setup (one-time)
+### Virtual monitor setup
 
-evdi requires root to add devices (`/sys/devices/evdi/add` is root-only). Do it once per boot:
+The `.deb` package handles this automatically: it pulls in `evdi-dkms`, drops `/lib/modules-load.d/ferrite.conf` (autoloads evdi at boot), and enables `ferrite-evdi-add.service` — a oneshot that writes `1 > /sys/devices/evdi/add` after `systemd-modules-load`, creating a `/dev/dri/cardN`. Host reuses that card; no per-boot manual step.
+
+For source / `install.sh` installs, do it by hand once per boot:
 
 ```bash
-sudo apt install evdi-dkms libevdi-dev   # once, at install time
-sudo modprobe evdi                        # usually autoloaded
-echo 1 | sudo tee /sys/devices/evdi/add   # creates /dev/dri/cardN
+sudo apt install evdi-dkms libevdi-dev
+sudo modprobe evdi
+echo 1 | sudo tee /sys/devices/evdi/add
 ```
 
-Confirm a new `cardN` appears in `/dev/dri/`, then `FERRITE_MODE=virtual` can find it via `evdi_check_device`. To tear down: `echo 1 | sudo tee /sys/devices/evdi/remove_all` or reboot.
+Confirm a new `cardN` appears in `/dev/dri/`, then `FERRITE_MODE=virtual` can find it via `evdi_check_device`. Tear down: `echo 1 | sudo tee /sys/devices/evdi/remove_all` or reboot.
 
-The user then enables and positions the new display in **COSMIC Settings → Displays** (appears as a "22.6\" DVI-I-1 external display" / "Linux FHD" from our EDID). Dragging windows to that output makes them stream to the Android client.
+Users enable/position the display in **COSMIC Settings → Displays** (appears as "22.6\" DVI-I-1 external display" / "Linux FHD" from our EDID). Dragging windows to that output makes them stream to the Android client.
 
 ### H.264 dump for debugging
 
@@ -148,4 +152,4 @@ Set `FERRITE_H264_DUMP=/tmp/capture.h264` to spawn a second ffmpeg inline with t
 
 ## Current state
 
-End-to-end live-video mirror + virtual-monitor working. Host captures (portal or evdi) → RGB → ffmpeg `h264_vaapi` → TCP. Android reads chunks → MediaCodec → SurfaceView render. Input path (touch/pen Android → host) is **not yet implemented** — `ClientMessage::TouchEvent` variant exists in the protocol but no one reads it on the host.
+End-to-end live-video mirror + virtual-monitor working. Host captures (portal or evdi) → RGB → ffmpeg `h264_vaapi` → transport (TCP / `adb reverse` / AOA). Android reads chunks → MediaCodec → SurfaceView render. Input path is fully wired: Android sends `ClientMessage::{Pointer, Touches}`, host dispatches to per-client uinput devices (`input.rs::InputSink`: multi-touch MT-B touchscreen + pen tablet with pressure/proximity/eraser). Pen is mirrored onto the touch device by default so non-`tablet_v2` apps see cursor movement (`FERRITE_PEN_MIRROR=0` to disable). See `STATUS.md` for the current what-works ledger.
